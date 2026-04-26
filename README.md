@@ -1,7 +1,7 @@
 # Shinra-Meisin
-### *神羅明眸 — "All-Seeing"*
+### *神羅明眸 — "The All-Seeing Eminence Of Shadow"*
 
-**Shinra-Meisin** is an open-source, extensible image-to-prediction tracking pipeline developed by **Walker Industries R&D** in partnership with **EOZVR**. Its first application is binocular eye tracking for VR/AR headsets, designed to run in real time on embedded hardware, but the architecture is deliberately general: given the right dataset and output heads, the same system can learn to track mouths, tongues, or full body pose.
+**The Shinra-Meisin** is an open-source, extensible tracking pipeline developed by **Walker Industries R&D** in partnership with **EOZVR**. Its first application is the binocular eye tracking system for VR/AR headsets, designed to run in real time on embedded hardware, but the architecture is deliberately general: given the right dataset and output heads, the same system can learn to track mouths, tongues, or full body pose.
 
 Shinra-Meisin is the tracking core of the **VectorGear** XR headset and the underlying model behind **SM-Tracker**, a plug-and-play snap-on add-on for popular consumer HMDs (Meta Quest 3/3S, BigScreen Beyond 2, Pimax Dream Air).
 
@@ -137,8 +137,9 @@ Shinra-Meisin is in active development. The current checkpoint (epoch 34) has be
 
 **Later:**
 - Mouth / lip / tongue tracking (same backbone, new heads and dataset)
-- Crowdfunded FOSS dataset collected across target HMDs
-- Full body inside-out tracking
+- Inhouse curated FOSS dataset collected across target HMDs
+- Full body inside-out tracking for our WIP controllers
+- BCI Data layer with VRChat OSC + Resonite and [Eclipse](https://github.com/Walker-Industries-RnD/Eclipse/tree/main/EclipseProject) Layer
 
 ---
 
@@ -165,6 +166,22 @@ See `requirements.txt` for the full pinned dependency list.
 ---
 
 ## License
+
+
+Copyright (c) 2026 Walker Industries R&D All rights reserved.
+
+This is a work-in-progress prototype. You may view the source code for personal evaluation purposes only. NO license is granted (express or implied) for:
+
+- copying
+- modification
+- distribution
+- commercial use
+- derivative works
+- or any other form of exploitation
+  
+It'll be open-sourced when it's actually ready and has examples ready. Until then: look, don't touch. Seriously.
+
+
 <img src="https://github.com/Walker-Industries-RnD/Malicious-Affiliation-Ban/blob/main/WIBan.png?raw=true" align="center" style="margin-left: 20px; margin-bottom: 20px;"/>
 
 > Unauthorized use of the artwork — including but not limited to copying, distribution, modification, or inclusion in any machine-learning training dataset — is strictly prohibited and will be prosecuted to the fullest extent of the law.
