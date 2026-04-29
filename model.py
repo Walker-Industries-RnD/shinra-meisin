@@ -162,8 +162,8 @@ class ShinraCNN(nn.Module):
             heads = (list(self.diameter_pred.parameters()) +
                      list(self.diameter_log_var.parameters()) +
                      list(self.gaze_head.parameters()))
-            optim_groups = [{'params': heads, 'lr': 5e-4/max(i,1)}, {'params': list(self.heatmap_head.parameters()), 'lr': 5e-4}]
-            optim_groups += [{'params': seg.parameters(), 'lr': 2.5e-4} for seg in self.segments[:i+1]]
+            optim_groups = [{'params': heads, 'lr': 1e-4}, {'params': list(self.heatmap_head.parameters()), 'lr': 2e-4}]
+            optim_groups += [{'params': seg.parameters(), 'lr': 2e-4} for seg in self.segments[:i+1]]
 
             yield phase, optim_groups
 
