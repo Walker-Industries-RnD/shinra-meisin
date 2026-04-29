@@ -226,6 +226,5 @@ phase_2/
 phase_3/
 phase_4/
 *.docx
-*.md
 ./*.pth
 ./*.txt
