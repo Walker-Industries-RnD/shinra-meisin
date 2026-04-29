@@ -44,48 +44,65 @@ Shinra-Meisin is like a student learning to read eyes by studying millions of sy
 
 ## Architecture — The Technical Version
 
-Shinra-Meisin is a **multi-task CNN** built on a MobileNetV3-Small backbone modified for single-channel infrared input. The backbone is split into three explicitly tapped stages, each feeding a different output head:
+Shinra-Meisin is a **multi-task CNN** built on a MobileNetV3-Small backbone modified for single-channel infrared input. Rather than hardcoding a fixed set of skip connections, the model **dynamically segments the backbone at every strided convolution** — one segment per resolution-halving layer, one skip connection saved per segment. This makes the decoder chain automatically adapt to different backbone choices without manual wiring.
+
+On MobileNetV3-Small, `backbone.features` (everything before the GAP and classifier) contains five strided layers, producing five segments and a bottleneck at **7×7×96**:
 
 ```
 Input (224×224×1 IR)
         │
    ┌────▼────┐
-   │  Early  │  layers 0–3 → 28×28×24  ──────────────────┐ skip
-   └────┬────┘                                             │
-        │                                                  │
-   ┌────▼────┐                                             │
-   │   Mid   │  layers 4–6 → 14×14×40  ─────────┐ skip   │
-   └────┬────┘                                   │         │
-        │                                        │         │
-   ┌────▼────┐                                   │         │
-   │  Deep   │  layers 7–12 → 1×1×576            │         │
-   └────┬────┘                                   │         │
-        │                                        │         │
-        ├──► Gaze Head (3D unit vector)           │         │
-        │                                        │         │
-        │  pointwise 1×1 conv (576→40)           │         │
-        │  bilinear upsample (1×1 → 14×14)       │         │
-        │  concat with mid skip ──────────────────┘         │
-        │  depthwise+pointwise → 14×14×48                   │
-        │       │                                           │
-        │       ├──► Eyelid Head (8×2 landmark points)      │
-        │       │                                           │
-        │       │  bilinear upsample (14×14 → 28×28)       │
-        │       │  concat with early skip ──────────────────┘
-        │       │  depthwise+pointwise → 28×28×16
-        │       │       │
-        │       │       └──► Pupil Head (2D position + diameter)
+   │  Seg 0  │  stride-2  →  112×112×16  ────────────────────────────────────────┐ skip₀
+   └────┬────┘                                                                     │
+        │                                                                          │
+   ┌────▼────┐                                                                     │
+   │  Seg 1  │  stride-2  →   56×56×16   ──────────────────────────────┐ skip₁   │
+   └────┬────┘                                                           │          │
+        │                                                                │          │
+   ┌────▼────┐                                                           │          │
+   │  Seg 2  │  stride-2  →   28×28×24   ─────────────────────┐ skip₂  │          │
+   └────┬────┘                                                  │         │          │
+        │                                                       │         │          │
+   ┌────▼────┐                                                  │         │          │
+   │  Seg 3  │  stride-2  →   14×14×40   ──────────┐ skip₃    │         │          │
+   └────┬────┘                                      │            │         │          │
+        │                                           │            │         │          │
+   ┌────▼────┐                                      │            │         │          │
+   │  Seg 4  │  stride-2  →    7×7×96  (bottleneck) │            │         │          │
+   └────┬────┘                                      │            │         │          │
+        │                                           │            │         │          │
+        ├──► Gaze Head  (GAP → 96-d FC → 3D unit vector + σ²)   │         │          │
+        │                                           │            │         │          │
+        │  upsample  7→14,  cat skip₃ ──────────────┘            │         │          │
+        │  DepthwiseSepConv  →  14×14×40                          │         │          │
+        │       │                                                  │         │          │
+        │  upsample 14→28,  cat skip₂ ──────────────────────────── ┘         │          │
+        │  DepthwiseSepConv  →  28×28×24                                      │          │
+        │       │                                                              │          │
+        │  upsample 28→56,  cat skip₁ ──────────────────────────────────────── ┘          │
+        │  DepthwiseSepConv  →  56×56×16                                                  │
+        │       │                                                                          │
+        │  upsample 56→112, cat skip₀ ──────────────────────────────────────────────────── ┘
+        │  DepthwiseSepConv  →  112×112×16
+        │       │
+        │       ├──► Heatmap Head  (1×1 conv  →  112×112×17)
+        │       │      ch 0      :  pupil center
+        │       │      ch 1–8   :  upper eyelid (8 landmarks)
+        │       │      ch 9–16  :  lower eyelid (8 landmarks)
+        │       │      [inference: soft-argmax  →  (B, 17, 2) coordinates]
+        │       │
+        │       └──► Diameter Head  (GAP → 16-d MLP → scalar + σ²)
 ```
 
-### U-Net Style Spatial Decoders
+### Dynamic, Extensible U-Net Decoder Chain
 
-The key architectural choice is a **U-Net inspired decoder** for the spatial prediction heads (pupil and eyelid). A standard approach would collapse spatial feature maps with global average pooling before prediction — fast, but it destroys the precise location information that pupil and eyelid landmark prediction require.
+The spatial decoder is built from a chain of `DecodeBlock` modules — one per consecutive pair of adjacent skip connections, assembled automatically from the backbone's stride points. Each `DecodeBlock` bilinearly upsamples its input to match the next skip's spatial size, concatenates the two, and refines through a depthwise separable convolution. The chain passes features progressively from the deep bottleneck all the way back to the shallowest resolution, accumulating fine spatial detail at each step.
 
-Instead:
-- The **deep** stage (576 channels, 1×1) is projected down via a cheap pointwise convolution and upsampled back to match the **mid** stage resolution (14×14). The two are concatenated and mixed with a depthwise separable convolution, producing the eyelid decoder features.
-- Those eyelid features are then upsampled again to match the **early** stage (28×28), concatenated with the early skip connection, and mixed again — producing the pupil decoder features.
+Because the segments and blocks are derived programmatically rather than wired by hand, the decoder extends for free: swapping in a deeper backbone, or one with more strided layers, produces a longer chain with more skip connections without touching any other code.
 
-This "passing the torch" pattern lets each head predict from spatially-rich features at the resolution appropriate to its task, while still benefiting from the semantic context built up in the deeper layers.
+The single unified **heatmap head** — a 1×1 convolution at the end of the decoder — outputs all 17 landmark channels at 112×112. At inference, each channel's spatial distribution is decoded to a 2D coordinate via **soft-argmax** (weighted centroid over a softmax-normalized heatmap), giving sub-pixel localization without any argmax discontinuity. Pupil diameter is predicted from the same final decoder features through a separate pooling + MLP branch.
+
+The **gaze head** operates entirely independently, reading from the bottleneck via global average pooling before the decoder chain runs — it benefits from the backbone's full semantic depth but is never influenced by the decoder or the spatial heads.
 
 ### Uncertainty-Aware Predictions
 
@@ -97,15 +114,16 @@ In plain terms: when the model is uncertain, it automatically reduces the weight
 
 ### Progressive Training
 
-The backbone is trained in phases, unfreezing from deep to shallow:
+The backbone is unfrozen one segment at a time, from deepest to shallowest. Each phase adds the next segment to the optimizer with its own learning rate group, so earlier, more general features are always trained at a lower rate than the newly thawed layer:
 
-| Phase | Backbone state | Dataset |
+| Phase | Newly unfrozen segment | Dataset |
 |---|---|---|
-| 0 | Fully frozen | Synthetic only |
-| 1 | Deep unfrozen | Synthetic only |
-| 2 | Mid unfrozen | Synthetic + real IR (Dikablis) |
-| 3 | Early unfrozen | Full mixing, per-head dataset selection |
-| 4 | All unfrozen | Hardcase fine-tuning (optional) |
+| 0 | None — output heads only | Synthetic only |
+| 1 | Seg 4 — bottleneck (7×7×96) | Synthetic only |
+| 2 | Seg 3 — (14×14×40) | Synthetic only |
+| 3 | Seg 2 — (28×28×24) | Synthetic + real IR |
+| 4 | Seg 1 — (56×56×16) | Full mixing |
+| 5 | Seg 0 — shallowest (112×112×16) | Hardcase fine-tuning (optional) |
 
 ---
 
@@ -126,7 +144,7 @@ shinra-meisin/
 
 ## Current Status
 
-Shinra-Meisin is in active development. The current checkpoint (epoch 34) has been trained on synthetic UnityEyes data with the U-Net decoder architecture. Gaze prediction is converging well; pupil and eyelid heads are showing improvement with the spatial decoder over the earlier GAP-only approach.
+Shinra-Meisin is in active development. The current checkpoint has been trained on synthetic UnityEyes data with the dynamic U-Net decoder architecture. Gaze prediction is converging well; the unified heatmap head (pupil center + 17 eyelid landmarks) is showing improvement with the full spatial decoder chain over earlier GAP-only approaches.
 
 **Immediate roadmap:**
 - SRCGAN domain adaptation (synthetic → real NIR)
