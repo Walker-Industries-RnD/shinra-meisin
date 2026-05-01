@@ -2,8 +2,9 @@
 This is an early work-in-progress tracking pipeline accustomed to synthetic eye data ([dataset](https://huggingface.co/datasets/jpena-173/sm-eyes-v1)). However, it is possible to judge its current progress with input eye imagery. Here is what you need to do:
 
 1. Download sm-eyes-v1 (Parquet UnityEyes2-based dataset)
-2. Install requirements - python3 -m pip install -r requirements.txt
-3. Run visualize.py/debug_heatmap.py. Here are their descriptions:
+2. Go to dataset.py and change synth_dir to the sm-eyes-v1 installation directory
+3. Install requirements - python3 -m pip install -r requirements.txt
+4. Run visualize.py/debug_heatmap.py. Here are their descriptions:
 
 visualize.py
 Controls:
