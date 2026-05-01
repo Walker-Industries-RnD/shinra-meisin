@@ -1,6 +1,7 @@
 import time
 
-from model import ShinraCNN
+from model import ShinraCNN, HEATMAP_BORDER
+from visualize import hard_argmax_2d
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from dataset import SyntheticDS, synth_transforms
 from early_stopping import EarlyStopping
@@ -10,24 +11,25 @@ import torch, os
 import torch.nn.functional as F
 import torch.optim as optim
 
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 early_stopping_patience = 5
-num_epochs = 60
+num_epochs = 80
 batch_size = 64
 loss_weights = {
-    'diameter': 0.5,
-    'heatmaps': 500,
-    'gaze': 0.5
+    'diameter': .85,
+    'heatmaps': 700,
+    'contour': 2,
+    'gaze': .85
 }
-BORDER_PAD    = 8   # reflect-pad pixels added to each side of the model input
-HEATMAP_BORDER = 10  # heatmap pixels masked from each edge in the focal loss
 
-def focal_loss(logits, targets, gamma=2.0, alpha=0.75):
+def focal_loss(logits, targets, gamma=2, alpha=0.9):
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
     p_t = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
     alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
     loss = alpha_t * (1 - p_t) ** gamma * bce
+
     # zero out the outer HEATMAP_BORDER pixels so residual edge activations don't tamper with the loss
     m = HEATMAP_BORDER
     mask = torch.ones_like(loss)
@@ -35,7 +37,23 @@ def focal_loss(logits, targets, gamma=2.0, alpha=0.75):
     mask[..., -m:, :] = 0
     mask[..., :, :m] = 0
     mask[..., :, -m:] = 0
-    return (loss * mask).sum() / mask.sum()
+
+    focal = (loss * mask).sum() / mask.sum()
+
+    # half-max contour MSE
+    pred_peak   = logits.amax(dim=(-2, -1), keepdim=True)   # (B, C, 1, 1)
+    gt_peak     = targets.amax(dim=(-2, -1), keepdim=True)
+
+    pred_region = F.relu(logits - pred_peak * 0.75)
+    gt_region   = F.relu(targets  - gt_peak   * 0.75)
+
+    active      = (pred_peak > 0.1)          # (B, C, 1, 1) bool, broadcasts over H×W
+    pred_region = pred_region * active
+    gt_region   = gt_region   * active
+
+    contour_loss = F.mse_loss(pred_region, gt_region)
+
+    return focal + loss_weights['contour'] * contour_loss
 
 def heteroscedastic_loss(pred, truth, log_var, weight=None):
     precision = torch.exp(-log_var)
@@ -68,8 +86,8 @@ synth_sets = random_split(synth_ds, [int(len(synth_ds) * 0.8), int(len(synth_ds)
 
 train_set, val_set = synth_sets[0], synth_sets[1]
 
-train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=16, pin_memory=True, drop_last=True)
-val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=16, pin_memory=True, drop_last=True)
+train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=6, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=6, pin_memory=True, drop_last=True)
 
 torch.backends.cudnn.benchmark = True
 
@@ -80,8 +98,9 @@ shinra = ShinraCNN(backbone, out_channels=17).to(device)
 ckpt_path, start_phase, _ = find_latest_checkpoint()
 thaw_gen = shinra.thaw()
 _, optim_groups = next(thaw_gen)
-for _ in range(start_phase - 1):
-    _, optim_groups = next(thaw_gen)
+if start_phase > 1:
+    for _ in range(start_phase - 1):
+        _, optim_groups = next(thaw_gen)
 
 # Load weights and optimizer state if resuming
 optimizer = optim.Adam(optim_groups, lr=1e-3)
@@ -107,7 +126,7 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
     optimizer = optim.Adam(optim_groups, lr=1e-3)
 
     stopper.reset()
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, start_epoch + num_epochs):
         epoch_losses = {head: [] for head in loss_weights.keys()}
         pred_time = []
 
@@ -115,8 +134,9 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
         for batch_idx, (imgs, lbls) in enumerate(train_loader):
             optimizer.zero_grad()
             with torch.amp.autocast('cuda'):
+                time.sleep(0.2)
                 before = time.monotonic_ns()
-                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32), border_pad=BORDER_PAD)
+                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
                 if batch_idx > 0:
                     pred_time.append(time.monotonic_ns() - before)
 
@@ -152,7 +172,8 @@ for phase_idx, (phase, optim_groups) in enumerate(thaw_gen, start=start_phase):
         shinra.eval()
         with torch.no_grad():
             for imgs, lbls in val_loader:
-                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32), border_pad=BORDER_PAD)
+                time.sleep(0.2)
+                (diam_val, diam_lv), hm_val, (gaze_val, gaze_lv) = shinra(imgs.to(device, dtype=torch.float32))
 
                 diam_gt  = lbls['pupil_diameter'].to(device, dtype=torch.float32).unsqueeze(-1)
                 hm_gt    = lbls['eye_heatmaps'].to(device, dtype=torch.float32)

@@ -4,7 +4,8 @@ debug_heatmaps.py — navigate Shinra-Meisin heatmap tensors at full resolution.
 
 Panels per sample:
   [Overview group]  source image, pred overlay (max across channels), GT overlay
-  [Channels group]  per-channel heatmaps (pred then GT)
+  [Channels group]  pupil overlaid on each of the 16 landmark channels, then
+                    standalone heatmaps for those 16 channels
 
 Controls:
   ← / →  or scroll wheel   previous / next panel
@@ -29,7 +30,7 @@ from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 from model import ShinraCNN
 from dataset import SyntheticDS
-from visualize import find_latest_checkpoint, decode_heatmaps, synth_inference_transforms
+from visualize import find_latest_checkpoint, decode_heatmaps, synth_inference_transforms, MAX_IRIS_DIAMETER
 
 device = torch.device('cpu')
 
@@ -62,8 +63,10 @@ def load_model():
 def run_inference(shinra, raw_img):
     x = synth_inference_transforms(raw_img).unsqueeze(0).to(device)
     with torch.no_grad():
-        _, hm, _ = shinra(x)
-    return torch.sigmoid(hm[0]).cpu().numpy()  # (17, H, W)
+        (diam_pred, _), hm, _, dec_feats = shinra(x, return_decoder_feats=True)
+    diameter = diam_pred[0].squeeze().item()
+    decoder_feats = [f[0].numpy() for f in dec_feats]  # list of (C, H, W)
+    return torch.sigmoid(hm[0]).cpu().numpy(), diameter, decoder_feats  # (17, H, W), scalar, feats
 
 
 # ── panels ──────────────────────────────────────────────────────────────────────
@@ -78,10 +81,28 @@ def _info_text(ax, text, loc='bottom'):
             bbox=dict(facecolor='black', alpha=0.6, edgecolor='none', pad=4))
 
 
-def _draw_source(ax, img_np):
+def _draw_source(ax, img_np, pred_center=None, pred_diam_px=None, gt_center=None, gt_diam_px=None):
     ax.imshow(img_np, cmap='gray')
     h, w = img_np.shape[:2]
     _info_text(ax, f'{w}×{h}')
+
+    if gt_center is not None and gt_diam_px is not None:
+        gx, gy = gt_center
+        half = gt_diam_px / 2
+        ax.plot([gx - half, gx + half], [gy - 4, gy - 4],
+                color=GT_COLOR, linewidth=2.0, zorder=5)
+        ax.scatter([gx], [gy], c=GT_COLOR, s=40, zorder=6, label='GT pupil')
+
+    if pred_center is not None and pred_diam_px is not None:
+        px, py = pred_center
+        half = pred_diam_px / 2
+        ax.plot([px - half, px + half], [py, py],
+                color=PRED_COLOR, linewidth=2.0, zorder=5)
+        ax.scatter([px], [py], c=PRED_COLOR, s=40, zorder=6, label='pred pupil')
+
+    if pred_center is not None or gt_center is not None:
+        ax.legend(fontsize=8, loc='upper right', framealpha=0.6)
+
     ax.axis('off')
 
 
@@ -166,13 +187,108 @@ def _draw_channel(ax, hm_ch, gt_peak):
     ax.axis('off')
 
 
-def build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred):
+def _draw_channel_with_pupil(ax, hm_ch, pupil_hm, gt_peak_ch, gt_peak_pupil):
+    """Render hm_ch (hot) with pupil_hm (cool) blended on top."""
+    H, W = hm_ch.shape
+    py, px = np.unravel_index(hm_ch.argmax(), hm_ch.shape)
+
+    im = ax.imshow(hm_ch, cmap='hot', vmin=0, vmax=1, interpolation='nearest')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    pupil_rs = pupil_hm if pupil_hm.shape == hm_ch.shape else _resize_hm(pupil_hm, H, W)
+    ax.imshow(pupil_rs, cmap='hot', vmin=0, vmax=1, alpha=0.45, interpolation='nearest')
+
+    half = hm_ch.max() * 0.5
+    if half > 0.01:
+        ax.contour(hm_ch, levels=[half], colors=[PRED_COLOR],
+                   linewidths=0.9, alpha=0.8, zorder=4)
+
+    pupil_half = pupil_rs.max() * 0.5
+    if pupil_half > 0.01:
+        ax.contour(pupil_rs, levels=[pupil_half], colors=['magenta'],
+                   linewidths=0.9, alpha=0.8, zorder=4)
+
+    ax.plot(px, py, '+', color=PRED_COLOR, markersize=12,
+            markeredgewidth=1.5, zorder=5, label='ch pred peak')
+
+    pup_py, pup_px = np.unravel_index(pupil_rs.argmax(), pupil_rs.shape)
+    ax.plot(pup_px, pup_py, 'D', color='magenta', markersize=7,
+            markeredgewidth=1.5, zorder=5, label='pupil pred peak')
+
+    if gt_peak_ch is not None:
+        gx, gy = gt_peak_ch
+        ax.plot(gx, gy, 'x', color=GT_COLOR, markersize=10,
+                markeredgewidth=1.5, zorder=5, label='ch GT peak')
+    if gt_peak_pupil is not None:
+        gx, gy = gt_peak_pupil
+        ax.plot(gx, gy, 's', color='magenta', markersize=8,
+                markeredgewidth=1.5, zorder=5, fillstyle='none', label='pupil GT peak')
+
+    ax.legend(fontsize=8, loc='upper right', framealpha=0.6)
+    _info_text(ax,
+        f'pred ({px},{py})   max {hm_ch.max():.4f}   mean {hm_ch.mean():.5f}   [{W}×{H}]')
+    ax.axis('off')
+
+
+def _draw_decoder_grid(ax, dec_feats):
+    """Grid of all decoder block outputs (max-projection across channels) as a mosaic."""
+    n    = len(dec_feats)
+    cols = 2
+    rows = (n + cols - 1) // cols
+    cell = 72
+    sep  = 3
+    canvas = np.zeros((rows * cell + (rows - 1) * sep,
+                       cols * cell + (cols - 1) * sep), dtype=np.float32)
+
+    for i, feat in enumerate(dec_feats):
+        r, c = divmod(i, cols)
+        y0   = r * (cell + sep)
+        x0   = c * (cell + sep)
+        proj = feat.max(axis=0)               # (H, W)
+        mn, mx = proj.min(), proj.max()
+        if mx > mn:
+            proj = (proj - mn) / (mx - mn)
+        canvas[y0:y0 + cell, x0:x0 + cell] = _resize_hm(proj, cell, cell)
+
+    ax.imshow(canvas, cmap='hot', vmin=0, vmax=1, interpolation='nearest', aspect='equal')
+
+    for i, feat in enumerate(dec_feats):
+        r, c = divmod(i, cols)
+        y0   = r * (cell + sep)
+        x0   = c * (cell + sep)
+        C, H, W = feat.shape
+        ax.text(x0 + cell / 2, y0 + 3, f'blk{i}  {C}ch  {W}×{H}',
+                color='white', fontsize=7, ha='center', va='top', family='monospace',
+                bbox=dict(facecolor='black', alpha=0.55, edgecolor='none', pad=1))
+
+    ax.set_title('Decoder intermediaries  (max-proj per block)', fontsize=9, color='#dddddd', pad=4)
+    ax.axis('off')
+
+
+def build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred, diam_pred=None, diam_gt=None):
     """Source image + max-activation overlay (pred heatmap with GT region annotated)."""
     panels = []
 
+    h, w = img_np.shape[:2]
+
+    gt_center = gt_diam_px = pred_center = pred_diam_px = None
+    if lm_gt is not None:
+        gx = lm_gt[0, 0] * w / 640
+        gy = lm_gt[0, 1] * h / 480
+        gt_center = (gx, gy)
+        if diam_gt is not None:
+            gt_diam_px = diam_gt * MAX_IRIS_DIAMETER * w / 640
+    if have_pred and lm_pred is not None:
+        px = lm_pred[0, 0] * w / 640
+        py = lm_pred[0, 1] * h / 480
+        pred_center = (px, py)
+        if diam_pred is not None:
+            pred_diam_px = diam_pred * MAX_IRIS_DIAMETER * w / 640
+
     panels.append({
         'title': 'Source image',
-        'draw':  lambda ax, _img=img_np: _draw_source(ax, _img),
+        'draw':  lambda ax, _img=img_np, _pc=pred_center, _pdp=pred_diam_px, _gc=gt_center, _gdp=gt_diam_px:
+                     _draw_source(ax, _img, _pc, _pdp, _gc, _gdp),
     })
 
     max_gt = hm_gt.max(axis=0)
@@ -191,8 +307,8 @@ def build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred):
     return panels
 
 
-def build_channel_panels(hm_pred, hm_gt, have_pred):
-    """Per-channel pred heatmaps with pred + GT peak overlaid."""
+def build_channel_panels(hm_pred, hm_gt, have_pred, dec_feats=None):
+    """Per-channel pred heatmaps; pupil channel shown overlaid on each other channel."""
     if not have_pred:
         return []
 
@@ -205,13 +321,31 @@ def build_channel_panels(hm_pred, hm_gt, have_pred):
         gy, gx = np.unravel_index(hm_gt[c].argmax(), hm_gt[c].shape)
         gt_peaks.append((gx * W_pred / W_gt, gy * H_pred / H_gt))
 
-    return [
+    dec_draw = (lambda ax, _df=dec_feats: _draw_decoder_grid(ax, _df)) if dec_feats else None
+
+    # Pupil (ch 0) overlaid on each of the other 16 channels
+    pupil_panels = [
         {
-            'title': f'Pred  ch {c:02d}  {CHANNEL_NAMES[c]}',
-            'draw':  lambda ax, _c=c: _draw_channel(ax, hm_pred[_c], gt_peaks[_c]),
+            'title':        f'Pred  ch {c:02d}  {CHANNEL_NAMES[c]}  +  pupil overlay',
+            'draw':         lambda ax, _c=c: _draw_channel_with_pupil(
+                                ax, hm_pred[_c], hm_pred[0], gt_peaks[_c], gt_peaks[0]
+                            ),
+            'draw_decoder': dec_draw,
         }
-        for c in range(17)
+        for c in range(1, 17)
     ]
+
+    # Standalone panels for channels 1-16 (pupil channel omitted as standalone)
+    standalone_panels = [
+        {
+            'title':        f'Pred  ch {c:02d}  {CHANNEL_NAMES[c]}',
+            'draw':         lambda ax, _c=c: _draw_channel(ax, hm_pred[_c], gt_peaks[_c]),
+            'draw_decoder': dec_draw,
+        }
+        for c in range(1, 17)
+    ]
+
+    return pupil_panels + standalone_panels
 
 
 # ── navigator ──────────────────────────────────────────────────────────────────
@@ -225,7 +359,7 @@ class Navigator:
         self.idx     = 0   # panel index within the active group
         self._sample_label = sample_label
 
-        self.fig = plt.figure(figsize=(8, 8))
+        self.fig = plt.figure(figsize=(14, 7))
         self.fig.patch.set_facecolor('#111111')
         self._scroll_dir    = 0
         self._scroll_last   = 0.0
@@ -300,11 +434,21 @@ class Navigator:
                       f'[{group_label}]   ← → or scroll to navigate    Tab switch group    q close',
                       ha='center', va='bottom', fontsize=8, color='#666666')
 
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor('#111111')
-
         panel = self._panels[self.idx]
-        panel['draw'](self.ax)
+
+        if panel.get('draw_decoder'):
+            from matplotlib.gridspec import GridSpec
+            gs = GridSpec(1, 2, figure=self.fig, wspace=0.06)
+            self.ax = self.fig.add_subplot(gs[0])
+            self.ax.set_facecolor('#111111')
+            ax_dec = self.fig.add_subplot(gs[1])
+            ax_dec.set_facecolor('#111111')
+            panel['draw'](self.ax)
+            panel['draw_decoder'](ax_dec)
+        else:
+            self.ax = self.fig.add_subplot(111)
+            self.ax.set_facecolor('#111111')
+            panel['draw'](self.ax)
 
         self.ax.set_title(
             f'{self._sample_label}   [{self.idx + 1}/{len(self._panels)}]   {panel["title"]}',
@@ -354,11 +498,14 @@ def plot_sample(shinra, ds, idx):
     lm_gt  = decode_heatmaps(gt['eye_heatmaps'], out_w=640, out_h=480).numpy()
 
     have_pred = shinra is not None
+    dec_feats = None
     if have_pred:
-        hm_pred = run_inference(shinra, raw_img)
+        hm_pred, diam_pred, dec_feats = run_inference(shinra, raw_img)
         lm_pred = decode_heatmaps(torch.from_numpy(hm_pred), out_w=640, out_h=480).numpy()
     else:
-        hm_pred = lm_pred = None
+        hm_pred = lm_pred = diam_pred = None
+
+    diam_gt = float(gt['pupil_diameter'])
 
     print_stats(idx, hm_pred, hm_gt, have_pred)
 
@@ -367,8 +514,8 @@ def plot_sample(shinra, ds, idx):
     label  = (f'idx {idx}   pred {pw}×{ph}   gt {gw}×{gh}'
               if have_pred else f'idx {idx}   gt {gw}×{gh}')
 
-    overview_panels = build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred)
-    channel_panels  = build_channel_panels(hm_pred, hm_gt, have_pred)
+    overview_panels = build_overview_panels(img_np, hm_pred, hm_gt, lm_pred, lm_gt, have_pred, diam_pred, diam_gt)
+    channel_panels  = build_channel_panels(hm_pred, hm_gt, have_pred, dec_feats)
 
     Navigator(overview_panels, channel_panels, label)
 

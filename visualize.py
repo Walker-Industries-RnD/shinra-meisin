@@ -102,7 +102,7 @@ def infer(shinra, img_tensor, already_gray=False):
     transform = gray_inference_transforms if already_gray else synth_inference_transforms
     x = transform(img_tensor).unsqueeze(0).to(device, dtype=torch.float32)
     with torch.no_grad():
-        (diameter_pred, _), heatmap_logits, (gaze_vec, _) = shinra(x, decode=False, border_pad=8)
+        (diameter_pred, _), heatmap_logits, (gaze_vec, _) = shinra(x, decode=False)
     diameter = diameter_pred[0].squeeze().item()
     heatmaps = heatmap_logits[0]   # (17, 112, 112)
     gaze = gaze_vec[0].numpy()     # (3,)
@@ -138,6 +138,8 @@ def synthetic_mode(shinra):
         mse_diameter = float((diameter - gt_diameter) ** 2)
         mse_heatmaps = float(np.mean((lm_px - gt_landmarks) ** 2))
         mse_gaze     = float(np.mean((gaze - gt_gaze) ** 2))
+
+        print(diam_px, gt_diam_px)
 
         fig, ax = plt.subplots(figsize=(10, 7.5))
         ax.imshow(img_np, cmap='gray' if img_np.ndim == 2 else None,

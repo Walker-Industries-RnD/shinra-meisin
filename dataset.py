@@ -12,27 +12,39 @@ import torch
 import glob, os, json
 
 _photometric = v2.Compose([
-    v2.ColorJitter(brightness=0.2, contrast=0.2),
+    v2.ColorJitter(brightness=0.225, contrast=0.225),
     v2.Grayscale(num_output_channels=1),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize([0.5], [0.5]),
 ])
 
+BORDER_PAD = 8
+
 class SyntheticTransform:
     """
-    Resize(256) → RandomCrop(224) → RandomHorizontalFlip → photometric.
+    Resize(320, 320) → RandomCrop(224) → RandomHorizontalFlip → photometric → zero-pad(BORDER_PAD).
 
     Returns (img_tensor, crop_xy, flipped) so __getitem__ can forward
     crop_xy and flipped to convert() to keep GT heatmaps spatially aligned.
+    crop_xy is in pre-pad 224×224 space; convert() does not need adjustment
+    because the landmark math is relative to the unpadded crop origin.
+
+    NOTE: with BORDER_PAD > 0, model input is (224+2*BORDER_PAD)^2, so the
+    decoder's shallowest skip — and therefore heatmap output — will be larger
+    than heatmap_hw. The model must center-crop logits to heatmap_hw before loss.
+
+    Also, the 320, 320 center crop is deliberate. It allows the 224, 224 random crop to house a wider variety of edge cases, so that it also accounts for eyes close to the edge.
     """
     def __call__(self, img):
-        img = TF.resize(img, [256, 256], antialias=True)
+        img = TF.center_crop(img, [320, 320])
         top, left, _, _ = v2.RandomCrop.get_params(img, (224, 224))
         img = TF.crop(img, top, left, 224, 224)
         flipped = random.random() < 0.5
         if flipped:
             img = TF.horizontal_flip(img)
-        return _photometric(img), (left, top), flipped   # crop_xy = (x_offset, y_offset)
+        img = _photometric(img)
+        img = TF.pad(img, BORDER_PAD)
+        return img, (left, top), flipped   # crop_xy = (x_offset, y_offset)
 
 synth_transforms = SyntheticTransform()
 
