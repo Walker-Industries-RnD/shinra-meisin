@@ -1,0 +1,41 @@
+# yolo26.yaml
+nc: 80
+end2end: True
+reg_max: 1
+
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]   # ~2.4M params
+  s: [0.50, 0.50, 1024]   # ~9.5M params
+  m: [0.50, 1.00,  512]   # ~20.4M params
+  l: [1.00, 1.00,  512]   # ~24.8M params
+  x: [1.00, 1.50,  512]   # ~55.7M params
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]]          # 0  P1/2   → 320×240
+  - [-1, 1, Conv,  [128, 3, 2]]         # 1  P2/4   → 160×120
+  - [-1, 2, C3k2,  [256, False, 0.25]]  # 2         → 160×120
+  - [-1, 1, Conv,  [256, 3, 2]]         # 3  P3/8   → 80×60
+  - [-1, 2, C3k2,  [512, False, 0.25]]  # 4         → 80×60   ← your P3 tap
+  - [-1, 1, Conv,  [512, 3, 2]]         # 5  P4/16  → 40×30
+  - [-1, 2, C3k2,  [512, True]]         # 6         → 40×30
+  - [-1, 1, Conv,  [1024, 3, 2]]        # 7  P5/32  → 20×15
+  - [-1, 2, C3k2,  [1024, True]]        # 8         → 20×15
+  - [-1, 1, SPPF,  [1024, 5]]           # 9         → 20×15
+  - [-1, 2, C2PSA, [1024]]              # 10        → 20×15   ← your P5 tap
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]           # 12  cat P4
+  - [-1, 2, C3k2, [512, False]]         # 13
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]           # 15  cat P3
+  - [-1, 2, C3k2, [256, False]]         # 16  (P3/8)
+  - [-1, 1, Conv, [256, 3, 2]]          # 17
+  - [[-1, 13], 1, Concat, [1]]          # 18  cat head P4
+  - [-1, 2, C3k2, [512, False]]         # 19
+  - [-1, 1, Conv, [512, 3, 2]]          # 20
+  - [[-1, 10], 1, Concat, [1]]          # 21  cat P5
+  - [-1, 2, C3k2, [1024, True]]         # 22
+  - [[16, 19, 22], 1, Detect, [nc]]     # 23  Detect(P3, P4, P5)
