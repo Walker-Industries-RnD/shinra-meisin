@@ -15,9 +15,9 @@ from torch.utils.data import Dataset, Sampler, Subset
 from torchvision.transforms import v2
 import torchvision.transforms.v2.functional as TF
 
-GIW_DIR       = '/media/john/19c53eb3-e39d-4de8-a8c5-3b8ba8c41b1c2/GIW/'
-SYNTHETIC_DIR = '/media/john/19c53eb3-e39d-4de8-a8c5-3b8ba8c41b1c2/synthetic_v2/'
-WEBCAM_DIR    = '/media/john/19c53eb3-e39d-4de8-a8c5-3b8ba8c41b1c2/HybridGaze/'
+GIW_DIR       = os.path.expanduser('~/Downloads/datasets/GIW/')
+SYNTHETIC_DIR = os.path.expanduser('~/Downloads/datasets/synthetic_v2/')
+WEBCAM_DIR    = os.path.expanduser('~/Downloads/datasets/HybridGaze/')
 
 RAW_INPUT_W = 640
 RAW_INPUT_H = 480

@@ -230,3 +230,4 @@ phase_4/
 ./*.txt
 *.pth
 *.parquet
+__pycache__/

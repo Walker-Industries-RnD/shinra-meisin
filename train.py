@@ -3,11 +3,15 @@ from model import ShinraCNN
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch
-import time, os
+import time, os, math
 from torch.optim import Adam
 from early_stopping import EarlyStopping
 from numpy import mean
-from itertools import cycle
+
+def _infinite_loader(loader):
+    """Yields batches from loader indefinitely without caching them in RAM."""
+    while True:
+        yield from loader
 
 BATCH_SIZE = 64
 NUM_EPOCHS = 10 # per phase
@@ -72,11 +76,11 @@ giw_train, giw_val = session_split(real_ds)
 
 train_ds = SharedDataset(giw_subset=giw_train, synthetic=synth_ds, phase=start_phase, epoch_size=len(synth_ds))
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, shuffle=False)
-val_loader   = DataLoader(giw_val,  batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, shuffle=False)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, shuffle=False)
+val_loader   = DataLoader(giw_val,  batch_size=BATCH_SIZE, num_workers=2, pin_memory=True, shuffle=False)
 
-cam_loader   = DataLoader(cam_ds,   batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, shuffle=False)
-cam_cycle = cycle(cam_loader)
+cam_loader   = DataLoader(cam_ds,   batch_size=BATCH_SIZE, num_workers=2, pin_memory=True, shuffle=True)
+cam_cycle = _infinite_loader(cam_loader)
 
 scaler = torch.amp.GradScaler('cuda')
 stopper = EarlyStopping(PATIENCE)
@@ -138,14 +142,28 @@ for idx, groups in shinra.thaw():
     optim = Adam(params=groups, lr=1e-4)
 
     stopper.reset()
+    dann_active = idx > 1
     for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
         epoch_losses = {head: [] for head in loss_weights.keys()}
         pred_time = []
 
+        if dann_active:
+            if idx == 2:
+                progress = (epoch - start_epoch) / max(NUM_EPOCHS - 1, 1)
+                lam = 2.0 / (1.0 + math.exp(-10.0 * progress)) - 1.0
+            else:
+                lam = 1.0
+            shinra.dann_clf.grl.lambda_.fill_(lam)
+
         train_ds.reshuffle()
         shinra.train()
 
-        for batch_idx, ((imgs, lbls), cam_imgs) in enumerate(zip(train_loader, cam_cycle)):
+        batch_iter = ( # only phase 2+ pulls from the webcam dataset, so change up the generator accordingly
+            ((imgs, lbls), next(cam_cycle)) for imgs, lbls in train_loader
+        ) if dann_active else (
+            ((imgs, lbls), None) for imgs, lbls in train_loader
+        )
+        for batch_idx, ((imgs, lbls), cam_imgs) in enumerate(batch_iter):
             with torch.amp.autocast('cuda'):
                 total_loss, t = process_batch(idx, shinra, optim, (imgs, cam_imgs), lbls, epoch_losses)
             pred_time.append(t)

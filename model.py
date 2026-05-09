@@ -119,7 +119,7 @@ class ShinraCNN(nn.Module):
         gaze_pred, gaze_lvar = self.gaze_head(taps[2]) # 8x6x256. gaze is a global deal
         diam_pred, diam_lvar = self.diameter_head(taps[2]) # also 8x6x256, we have it pull from a pooled deep tap too because spanning the pupil with respect to the whole eye could use some global context
 
-        if cam_imgs != None:
+        if cam_imgs is not None:
             cam_taps = run_backbone(cam_imgs)
             fused_cam_features = fuse(cam_taps[0], cam_taps[1])
             clf_preds = [self.dann_clf(fused_features), self.dann_clf(fused_cam_features)]
