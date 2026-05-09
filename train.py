@@ -1,18 +1,18 @@
-from input import GIWDataset, giw_transforms
+from input import SharedDataset, WebcamDataset, giw_transforms, cam_transforms, GIWDataset, session_split, SyntheticDataset
 from model import ShinraCNN
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch
 import time, os
 from torch.optim import Adam
 from early_stopping import EarlyStopping
 from numpy import mean
+from itertools import cycle
 
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 NUM_EPOCHS = 10 # per phase
 PATIENCE = 5 # for early stopping, this is how many epochs of no val loss improvement to end phase
 
-batch_size = 64
 loss_weights = {
     'diameter_se': 1,
     'diameter_lvar': 1,
@@ -52,15 +52,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 shinra = ShinraCNN().to(device)
 
-real_ds = GIWDataset(transforms=giw_transforms)
-_n_train  = int(len(real_ds) * 0.7)
-real_sets = random_split(real_ds, [_n_train, len(real_ds) - _n_train])
-
-train_set, val_set = real_sets[0], real_sets[1]
-
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, drop_last=True)
-val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, drop_last=True)
-
 torch.backends.cudnn.benchmark = True
 
 ckpt_path, start_phase, _ = find_latest_checkpoint()
@@ -72,16 +63,36 @@ if ckpt_path:
 else:
     print('Beginning from fresh start.')
     start_epoch = 0
-    
+
+
+real_ds  = GIWDataset(transforms=giw_transforms)
+synth_ds = SyntheticDataset(transforms=giw_transforms)
+cam_ds = WebcamDataset(transforms=cam_transforms)
+giw_train, giw_val = session_split(real_ds)
+
+train_ds = SharedDataset(giw_subset=giw_train, synthetic=synth_ds, phase=start_phase, epoch_size=len(synth_ds))
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, shuffle=False)
+val_loader   = DataLoader(giw_val,  batch_size=BATCH_SIZE, num_workers=6, pin_memory=True, shuffle=False)
+
+cam_loader   = DataLoader(cam_ds,   batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, shuffle=False)
+cam_cycle = cycle(cam_loader)
+
 scaler = torch.amp.GradScaler('cuda')
 stopper = EarlyStopping(PATIENCE)
 
-def process_batch(model, optim, imgs, lbls, epoch_losses=None, eval=False):
+def process_batch(phase, model, optim, imgs, lbls, epoch_losses=None, eval=False):
     if not eval:
         optim.zero_grad()
 
+    train_imgs = imgs[0]
+    cam_imgs = imgs[1]
+
     before = time.monotonic_ns()
-    landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar) = model(imgs.to(device))
+    
+    cam_arg = cam_imgs.to(device) if (phase > 1 and cam_imgs is not None) else None
+    landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds = model(train_imgs.to(device), cam_imgs=cam_arg)
+
     pred_time = time.monotonic_ns() - before
 
     landmark_gt = lbls['landmarks'].to(device)
@@ -93,6 +104,19 @@ def process_batch(model, optim, imgs, lbls, epoch_losses=None, eval=False):
     landmark_loss = F.smooth_l1_loss(landmark_pred, landmark_gt, beta=0.025)
 
     total_loss = (loss_weights['diameter_se'] * diameter_loss) + (loss_weights['gaze_se'] * gaze_loss) + (loss_weights['landmarks'] * landmark_loss)
+
+    if phase > 1 and clf_preds:
+        b = clf_preds[0].size(0)
+        domain_loss_orig = F.binary_cross_entropy_with_logits(
+            clf_preds[0].squeeze(1),
+            torch.zeros(b, device=device)
+        )
+        domain_loss_cam = F.binary_cross_entropy_with_logits(
+            clf_preds[1].squeeze(1),
+            torch.ones(b, device=device)
+        )
+        total_loss += domain_loss_orig + domain_loss_cam
+
 
     if epoch_losses:
         epoch_losses['diameter_se'].append(diam_sq_err)
@@ -118,10 +142,12 @@ for idx, groups in shinra.thaw():
         epoch_losses = {head: [] for head in loss_weights.keys()}
         pred_time = []
 
+        train_ds.reshuffle()
         shinra.train()
-        for batch_idx, (imgs, lbls) in enumerate(train_loader):
+
+        for batch_idx, ((imgs, lbls), cam_imgs) in enumerate(zip(train_loader, cam_cycle)):
             with torch.amp.autocast('cuda'):
-                total_loss, t = process_batch(shinra, optim, imgs, lbls, epoch_losses)
+                total_loss, t = process_batch(idx, shinra, optim, (imgs, cam_imgs), lbls, epoch_losses)
             pred_time.append(t)
 
             scaler.scale(total_loss).backward()
@@ -142,7 +168,7 @@ for idx, groups in shinra.thaw():
         with torch.no_grad():
             for imgs, lbls in val_loader:
                 with torch.amp.autocast('cuda'):
-                    total_loss, _ = process_batch(shinra, optim, imgs, lbls, epoch_losses=None, eval=True)
+                    total_loss, _ = process_batch(idx, shinra, optim, (imgs, None), lbls, epoch_losses=None, eval=True)
                 val_losses.append(total_loss.item())
 
         print(f'VAL LOSS: {mean(val_losses):.4f}')

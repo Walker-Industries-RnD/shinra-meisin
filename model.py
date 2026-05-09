@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 from ultralytics.nn.modules import Conv
 from input import INPUT_W, INPUT_H
+from dann import DomainClassifier
 
 YOLO_MODEL = 'yolo26n.pt'
 
@@ -50,10 +51,12 @@ class HeatmapHead(nn.Module): # heatmaps for precise sub-pixel localization
 
         self.temp = temp
 
-        # initialize 1x1 conv gateway. 192 (128+64) channels is a lot
-        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=False)
+        # initialize 1x1 conv gateways. 192 (128+64) channels is a lot
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=in_channels // 2, kernel_size=1, bias=False)
+        self.act = nn.SiLU()
+        self.conv2 = nn.Conv2d(in_channels=in_channels // 2, out_channels=out_channels, kernel_size=1, bias=False)
     def forward(self, x):
-        logits = self.conv(x)
+        logits = self.conv2(self.act(self.conv1(x)))
 
         B, C, H, W = logits.shape
         soft_map = torch.softmax(logits.view(B, C, -1) / self.temp, dim=-1).view(B, C, H, W) # 2d softmax here - first explode logits to (B, C, 64*48), do softmax, then reshape to (B, C, H, W)
@@ -98,17 +101,32 @@ class ShinraCNN(nn.Module):
         self.gaze_head = RegressionHead(in_features=256, out_features=3, pool=True)
         self.diameter_head = RegressionHead(in_features=256, out_features=1, pool=True)
         self.landmark_head = HeatmapHead(in_channels=192, out_channels=17)
-    def forward(self, x):
-        taps = []
-        for segment in self.segments:
-            x = segment(x)
-            taps.append(x)
+        self.dann_clf = DomainClassifier(in_channels=192)
+    def forward(self, x, cam_imgs=None):
+        def run_backbone(x):
+            taps = []
+            for segment in self.segments:
+                x = segment(x)
+                taps.append(x)
+            
+            return taps
+        
+        taps = run_backbone(x)
 
-        landmark_pred = self.landmark_head(fuse(taps[0], taps[1])) # 64x48x192, fused from 64x48x64 (early) and 32x24x128 (mid) FPN style
+        fused_features = fuse(taps[0], taps[1])
+
+        landmark_pred = self.landmark_head(fused_features) # 64x48x192, fused from 64x48x64 (early) and 32x24x128 (mid) FPN style
         gaze_pred, gaze_lvar = self.gaze_head(taps[2]) # 8x6x256. gaze is a global deal
         diam_pred, diam_lvar = self.diameter_head(taps[2]) # also 8x6x256, we have it pull from a pooled deep tap too because spanning the pupil with respect to the whole eye could use some global context
 
-        return landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar)
+        if cam_imgs != None:
+            cam_taps = run_backbone(cam_imgs)
+            fused_cam_features = fuse(cam_taps[0], cam_taps[1])
+            clf_preds = [self.dann_clf(fused_features), self.dann_clf(fused_cam_features)]
+        else:
+            clf_preds = []
+
+        return landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds
     def thaw(self):
         head_lr_map = torch.linspace(5e-4, 1e-4, len(self.segments))
         segment_lr_map = torch.linspace(2e-4, 2e-5, len(self.segments))
