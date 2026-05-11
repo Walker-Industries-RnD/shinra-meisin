@@ -23,9 +23,9 @@ import torch
 import torchvision.transforms.v2.functional as TF
 
 from input import (
-    GIWDataset, INPUT_H, INPUT_W,
-    MAX_PUPIL_DIAMETER, RAW_INPUT_H, RAW_INPUT_W,
-    to_gray_tensor,
+    GIWDataset, SyntheticDataset, WebcamDataset,
+    INPUT_H, INPUT_W, MAX_PUPIL_DIAMETER, RAW_INPUT_H, RAW_INPUT_W,
+    cam_transforms, to_gray_tensor,
 )
 from model import ShinraCNN
 
@@ -74,15 +74,19 @@ def load_model(ckpt_path):
 # ── Shared inference ──────────────────────────────────────────────────────────
 
 def run_inference(model, img_tensor):
-    """(1, 192, 256) tensor → (lm_np, diam_px, gaze_xyz)."""
+    """(1, 192, 256) tensor → (lm_np, diam_px, gaze_xyz, heatmap).
+
+    heatmap: (H, W) float32 — max activation across all 17 softmax landmark maps.
+    """
     with torch.no_grad():
-        lm_pred, (diam_pred, _), (gaze_pred, _) = model(
+        lm_pred, (diam_pred, _), (gaze_pred, _), _ = model(
             img_tensor.unsqueeze(0).to(DEVICE)
         )
     lm_np    = lm_pred[0].cpu().numpy()              # (17, 2) in [0,1]
     diam_px  = diam_pred[0, 0].item() * MAX_PUPIL_DIAMETER
     gaze_xyz = gaze_pred[0].cpu().numpy()             # (3,)
-    return lm_np, diam_px, gaze_xyz
+    heatmap  = model.landmark_head.last_soft_map[0].max(0).values.cpu().numpy()  # (H, W)
+    return lm_np, diam_px, gaze_xyz, heatmap
 
 
 def scale_lm(lm):
@@ -158,59 +162,125 @@ def preprocess_frame(bgr_frame):
 def dataset_mode(n_samples, ckpt_path):
     import random
     model = load_model(ckpt_path)
-    ds    = GIWDataset()
 
-    indices = random.sample(range(len(ds)), min(n_samples, len(ds)))
-    ncols = min(3, len(indices))
-    nrows = (len(indices) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4.2))
-    axes = np.array(axes).flatten()
+    n_per  = max(n_samples // 3, 1)
+    syn_ds = SyntheticDataset()
+    giw_ds = GIWDataset()
+    cam_ds = WebcamDataset(transforms=cam_transforms)
 
-    for ax_idx, ds_idx in enumerate(indices):
-        img_tensor, gt = ds[ds_idx]
-        lm_pred, diam_pred_px, gaze_pred = run_inference(model, img_tensor)
+    def sample(ds, k):
+        return random.sample(range(len(ds)), min(k, len(ds)))
 
-        lm_pred_px = scale_lm(lm_pred)
-        lm_gt_px   = scale_lm(gt['landmarks'].numpy())
-        diam_gt_px = gt['pupil_diameter'].item() * MAX_PUPIL_DIAMETER
-        gaze_gt    = gt['gaze_vector'].numpy()
+    groups = [
+        ('Synthetic', sample(syn_ds, n_per), syn_ds, True),
+        ('GIW',       sample(giw_ds, n_per), giw_ds, True),
+        ('Webcam',    sample(cam_ds, n_per), cam_ds, False),
+    ]
 
-        img_display = denorm_image(img_tensor)
+    # Pre-collect inference results so toggling doesn't re-run the model.
+    collected = []
+    for domain, idxs, ds, has_gt in groups:
+        row_samples = []
+        for idx in idxs:
+            if has_gt:
+                img_tensor, gt = ds[idx]
+            else:
+                img_tensor = ds[idx]
+                gt = None
+            lm_pred, diam_pred_px, gaze_pred, heatmap = run_inference(model, img_tensor)
+            s = {
+                'img_display': denorm_image(img_tensor),
+                'lm_pred_px':  scale_lm(lm_pred),
+                'gaze_pred':   gaze_pred,
+                'diam_pred_px': diam_pred_px,
+                'heatmap':     heatmap,
+                'domain':      domain,
+                'has_gt':      has_gt,
+            }
+            if gt is not None:
+                eye_state = int(gt['eye_state'].item())
+                s.update({
+                    'lm_gt_px':   scale_lm(gt['landmarks'].numpy()),
+                    'diam_gt_px': gt['pupil_diameter'].item() * MAX_PUPIL_DIAMETER,
+                    'gaze_gt':    gt['gaze_vector'].numpy(),
+                    'state':  'Synthetic' if eye_state == 0 else EYE_STATES.get(eye_state, '?'),
+                    'pvalid': 'pup✓' if gt['pupil_valid'].item() else 'pup✗',
+                    'lvalid': 'lid✓' if gt['lid_valid'].item()   else 'lid✗',
+                })
+            row_samples.append(s)
+        collected.append((domain, row_samples))
 
-        ax = axes[ax_idx]
-        ax.imshow(img_display, cmap='gray', origin='upper',
-                  extent=[0, DISPLAY_W, DISPLAY_H, 0])
+    ncols = n_per
+    fig, axes = plt.subplots(3, ncols, figsize=(ncols * 5, 3 * 4.2), squeeze=False)
+    show_hm = [False]
 
-        mpl_draw_landmarks(ax, lm_gt_px,   COLOR_GT,   label='GT')
-        mpl_draw_landmarks(ax, lm_pred_px, COLOR_PRED, label='Pred')
-        mpl_draw_gaze(ax, gaze_gt,   lm_gt_px[16],   COLOR_GT)
-        mpl_draw_gaze(ax, gaze_pred, lm_pred_px[16], COLOR_PRED)
+    def draw(hm_mode):
+        for row_idx, (domain, samples) in enumerate(collected):
+            for col, s in enumerate(samples):
+                ax = axes[row_idx][col]
+                ax.cla()
+                if col >= ncols:
+                    ax.axis('off')
+                    continue
 
-        state  = EYE_STATES.get(int(gt['eye_state'].item()), '?')
-        pvalid = 'pup✓' if gt['pupil_valid'].item() else 'pup✗'
-        lvalid = 'lid✓' if gt['lid_valid'].item()   else 'lid✗'
-        ax.set_title(
-            f'{state}  {pvalid} {lvalid}\n'
-            f'diam  GT={diam_gt_px:.1f}  pred={diam_pred_px:.1f}  (px)',
-            fontsize=8,
+                if hm_mode:
+                    hm = cv2.resize(s['heatmap'], (DISPLAY_W, DISPLAY_H),
+                                    interpolation=cv2.INTER_NEAREST)
+                    ax.imshow(hm, cmap='hot', interpolation='nearest', origin='upper',
+                              extent=[0, DISPLAY_W, DISPLAY_H, 0])
+                else:
+                    ax.imshow(s['img_display'], cmap='gray', origin='upper',
+                              extent=[0, DISPLAY_W, DISPLAY_H, 0])
+
+                ax.set_xlim(0, DISPLAY_W)
+                ax.set_ylim(DISPLAY_H, 0)
+                ax.axis('off')
+
+                if s['has_gt'] and not hm_mode:
+                    mpl_draw_landmarks(ax, s['lm_gt_px'],  COLOR_GT,   label='GT')
+                    mpl_draw_gaze(ax, s['gaze_gt'], s['lm_gt_px'][16], COLOR_GT)
+
+                mpl_draw_landmarks(ax, s['lm_pred_px'], COLOR_PRED, label='Pred')
+                mpl_draw_gaze(ax, s['gaze_pred'], s['lm_pred_px'][16], COLOR_PRED)
+
+                if s['has_gt']:
+                    ax.set_title(
+                        f'{s["state"]}  {s["pvalid"]} {s["lvalid"]}\n'
+                        f'diam  GT={s["diam_gt_px"]:.1f}  pred={s["diam_pred_px"]:.1f}  (px)',
+                        fontsize=8,
+                    )
+                else:
+                    ax.set_title(f'diam pred={s["diam_pred_px"]:.1f} px', fontsize=8)
+
+                if col == 0:
+                    ax.text(-0.08, 0.5, domain, transform=ax.transAxes,
+                            fontsize=11, fontweight='bold', va='center', ha='right',
+                            rotation=90)
+
+        handles = [mpatches.Patch(color=COLOR_PRED, label='Pred')]
+        if not hm_mode:
+            handles.insert(0, mpatches.Patch(color=COLOR_GT, label='GT'))
+        axes[0][0].legend(handles=handles, loc='lower right', fontsize=8)
+
+        mode_label = 'Heatmap' if hm_mode else 'Normal'
+        plt.suptitle(
+            f'Shinra-Meisin — multi-domain inference  [{mode_label} | ←/→ to toggle]',
+            fontsize=12,
         )
-        ax.set_xlim(0, DISPLAY_W)
-        ax.set_ylim(DISPLAY_H, 0)
-        ax.axis('off')
+        fig.canvas.draw_idle()
 
-        if ax_idx == 0:
-            ax.legend(
-                handles=[
-                    mpatches.Patch(color=COLOR_GT,   label='GT'),
-                    mpatches.Patch(color=COLOR_PRED, label='Pred'),
-                ],
-                loc='lower right', fontsize=8,
-            )
+    def on_key(event):
+        if event.key in ('left', 'right'):
+            show_hm[0] = not show_hm[0]
+            draw(show_hm[0])
 
-    for ax in axes[len(indices):]:
-        ax.axis('off')
+    # Remove matplotlib's default arrow-key navigation bindings so our handler
+    # receives them instead of the toolbar consuming them first.
+    plt.rcParams['keymap.back']    = [k for k in plt.rcParams['keymap.back']    if k != 'left']
+    plt.rcParams['keymap.forward'] = [k for k in plt.rcParams['keymap.forward'] if k != 'right']
 
-    plt.suptitle('Shinra-Meisin — inference visualization', fontsize=12)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    draw(False)
     plt.tight_layout()
     plt.show()
 
@@ -229,7 +299,8 @@ def webcam_mode(cam_index, ckpt_path):
     ]
     capture_idx = max(existing) + 1 if existing else 0
 
-    print("Webcam live — hold '1' to capture frames, press 'q' to quit.")
+    show_heatmap = False
+    print("Webcam live — ←/→ to toggle heatmap, hold '1' to capture, 'q' to quit.")
 
     while True:
         ok, frame = cap.read()
@@ -238,14 +309,21 @@ def webcam_mode(cam_index, ckpt_path):
             break
 
         img_tensor, crop = preprocess_frame(frame)
-        lm_pred, diam_px, gaze_xyz = run_inference(model, img_tensor)
+        lm_pred, diam_px, gaze_xyz, heatmap = run_inference(model, img_tensor)
 
-        # Full frame as canvas; swap crop region to grayscale so it reads as
-        # distinct from the surrounding color input.
         display = frame.copy()
-        crop_gray = cv2.cvtColor(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
-                                 cv2.COLOR_GRAY2BGR)
-        display[_CROP_Y:_CROP_Y + DISPLAY_H, _CROP_X:_CROP_X + DISPLAY_W] = crop_gray
+
+        if show_heatmap:
+            hm_u8 = (heatmap / (heatmap.max() + 1e-6) * 255).astype(np.uint8)
+            hm_bgr = cv2.applyColorMap(
+                cv2.resize(hm_u8, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_NEAREST),
+                cv2.COLORMAP_HOT,
+            )
+            display[_CROP_Y:_CROP_Y + DISPLAY_H, _CROP_X:_CROP_X + DISPLAY_W] = hm_bgr
+        else:
+            crop_gray = cv2.cvtColor(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                                     cv2.COLOR_GRAY2BGR)
+            display[_CROP_Y:_CROP_Y + DISPLAY_H, _CROP_X:_CROP_X + DISPLAY_W] = crop_gray
 
         # Shift landmarks from crop-space into full-frame-space before drawing.
         lm_px = scale_lm(lm_pred) + np.array([_CROP_X, _CROP_Y], dtype=np.float32)
@@ -257,9 +335,14 @@ def webcam_mode(cam_index, ckpt_path):
                     (_CROP_X + 8, _CROP_Y + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, CV_PRED, 1, cv2.LINE_AA)
 
-        key = cv2.waitKey(1) & 0xFF
+        # waitKeyEx returns full extended keycodes for special keys (arrows etc.)
+        key  = cv2.waitKeyEx(1)
+        key8 = key & 0xFF
 
-        if key == ord('1'):
+        if key in (65361, 65363):  # left / right arrow (Linux X11 / GTK)
+            show_heatmap = not show_heatmap
+
+        if key8 == ord('1'):
             gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             path = os.path.join(CAPTURE_DIR, f'{capture_idx:06d}.jpg')
             cv2.imwrite(path, gray_crop)
@@ -268,7 +351,7 @@ def webcam_mode(cam_index, ckpt_path):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 220), 2, cv2.LINE_AA)
 
         cv2.imshow('Shinra-Meisin', display)
-        if key == ord('q'):
+        if key8 == ord('q'):
             break
 
     cap.release()
@@ -283,8 +366,8 @@ def main():
                         help='Live webcam mode (1280×720 → 640×480 center crop)')
     parser.add_argument('--cam',  type=int, default=0,
                         help='Camera device index (default: 0)')
-    parser.add_argument('--n',    type=int, default=6,
-                        help='Number of random dataset samples (default: 6)')
+    parser.add_argument('--n',    type=int, default=9,
+                        help='Number of random dataset samples (default: 9, 3 per domain)')
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Path to checkpoint .pth (default: latest found)')
     args = parser.parse_args()

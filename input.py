@@ -22,7 +22,7 @@ WEBCAM_DIR    = os.path.expanduser('~/Downloads/datasets/HybridGaze/')
 RAW_INPUT_W = 640
 RAW_INPUT_H = 480
 
-INIT_SCALE = 0.4  # 640×480 → 256×192
+INIT_SCALE = 0.5  # 640×480 → 320x240
 INPUT_W = int(RAW_INPUT_W * INIT_SCALE)
 INPUT_H = int(RAW_INPUT_H * INIT_SCALE)
 
@@ -499,18 +499,14 @@ _PHASE_SYN_FRAC = [1.0 - 0.7 * p / 3 for p in range(4)]
 class SharedDataset(Dataset):
     """Synthetic + real-GIW dataset with per-epoch reshuffling.
 
-    Each epoch is laid out as:
-      1. N_syn synthetic samples drawn at random (shuffled)
-      2. N_real GIW frames organised as shuffled same-state contiguous runs
+    The synthetic-to-real ratio is fixed for the entire phase:
 
-    Call reshuffle() at the start of each epoch to regenerate the ordering.
+      Phase targets:
+        phase 0 → 1.00   phase 1 → ~0.77
+        phase 2 → ~0.53  phase 3 →  0.30
+
+    Call reshuffle() at the start of each epoch.
     The DataLoader should use shuffle=False (SequentialSampler).
-
-    Synthetic-to-real schedule (linear):
-      phase 0 → 100 % synthetic / 0 % real
-      phase 1 → ~77 % synthetic / ~23 % real
-      phase 2 → ~53 % synthetic / ~47 % real
-      phase 3 →  30 % synthetic / 70 % real
 
     epoch_size: total items per epoch (defaults to len(giw_subset)).
       For phase 0, if giw_subset is empty you must supply epoch_size explicitly.
@@ -524,50 +520,54 @@ class SharedDataset(Dataset):
         epoch_size: int | None = None,
     ):
         assert 0 <= phase <= 3, f'phase must be 0-3, got {phase}'
-        self._giw  = giw_subset
-        self._syn  = synthetic
-        self._phase = phase
-
-        syn_frac   = _PHASE_SYN_FRAC[phase]
-        total      = epoch_size if epoch_size is not None else len(giw_subset)
-        self._n_syn  = round(total * syn_frac)
-        self._n_real = total - self._n_syn
-
-        self._giw_runs   = _build_giw_runs(giw_subset) if self._n_real > 0 else []
-        self._syn_order:  list[int] = []
-        self._real_order: list[int] = []
-        self.reshuffle()
+        self._giw        = giw_subset
+        self._syn        = synthetic
+        self._phase      = phase
+        self._epoch_size = epoch_size if epoch_size is not None else len(giw_subset)
+        self._giw_runs   = _build_giw_runs(giw_subset) if len(giw_subset) > 0 else []
+        self._order: list[tuple[bool, int]] = []
+        self.reshuffle(epoch_progress=0.0)
 
     # ------------------------------------------------------------------
 
-    def reshuffle(self, seed: int | None = None) -> None:
+    def reshuffle(self, epoch_progress: float = 0.0, seed: int | None = None) -> None:
         """Regenerate epoch ordering.  Call once per epoch before iterating."""
         rng = random.Random(seed)
+        total    = self._epoch_size
+        syn_frac = _PHASE_SYN_FRAC[self._phase]
 
+        n_syn  = round(total * syn_frac)
+        n_real = total - n_syn
+
+        # Synthetic pool — wrap if more samples needed than available.
         syn_pool = list(range(len(self._syn)))
         rng.shuffle(syn_pool)
-        self._syn_order = syn_pool[:self._n_syn]
+        syn_indices = [syn_pool[i % len(syn_pool)] for i in range(n_syn)]
 
-        self._real_order = []
-        if self._n_real > 0:
+        # Real pool — sample via shuffled runs, wrap if needed.
+        real_indices: list[int] = []
+        if n_real > 0 and self._giw_runs:
             runs = list(self._giw_runs)
             rng.shuffle(runs)
             flat = [i for run in runs for i in run]
-            self._real_order = flat[:self._n_real]
+            real_indices = [flat[i % len(flat)] for i in range(n_real)]
+
+        # Combine and shuffle uniformly.
+        order = [(True, i) for i in syn_indices] + [(False, i) for i in real_indices]
+        rng.shuffle(order)
+        self._order = order
 
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self._syn_order) + len(self._real_order)
+        return len(self._order)
 
     def __getitem__(self, idx: int):
-        n = len(self._syn_order)
-        if idx < n:
-            return self._syn[self._syn_order[idx]]
-        return self._giw[self._real_order[idx - n]]
+        is_syn, src = self._order[idx]
+        return self._syn[src] if is_syn else self._giw[src]
     
 cam_transforms = v2.Compose([
-    v2.Resize((192, 256)),
+    v2.Resize((INPUT_H, INPUT_W)),
     v2.ToImage(),
     v2.ToDtype(torch.float32, scale=True),
     v2.Normalize([0.5], [0.5])

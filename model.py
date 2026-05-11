@@ -60,6 +60,7 @@ class HeatmapHead(nn.Module): # heatmaps for precise sub-pixel localization
 
         B, C, H, W = logits.shape
         soft_map = torch.softmax(logits.view(B, C, -1) / self.temp, dim=-1).view(B, C, H, W) # 2d softmax here - first explode logits to (B, C, 64*48), do softmax, then reshape to (B, C, H, W)
+        self.last_soft_map = soft_map  # (B, 17, H, W) — stashed for heatmap visualisation
         pred_x = (soft_map * self.grid_x).sum(dim=[-2, -1])
         pred_y = (soft_map * self.grid_y).sum(dim=[-2, -1])
         pts = torch.stack([pred_x, pred_y], dim=-1)
@@ -149,8 +150,11 @@ class ShinraCNN(nn.Module):
             optim_groups = [
                 {'params': head_params, 'lr': head_lr_map[i]},
             ]
-            
+
+            if i >= 1:  # phases 2 and 3 — dann_clf becomes active
+                optim_groups.append({'params': list(self.dann_clf.parameters()), 'lr': head_lr_map[i]})
+
             for j, seg in enumerate(thaw_list[:i+1]):
                 optim_groups.append({'params': seg.parameters(), 'lr': segment_lr_map[j]})
-            
+
             yield i+1, optim_groups
