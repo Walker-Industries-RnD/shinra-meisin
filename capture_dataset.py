@@ -337,6 +337,11 @@ def parse_args():
                     default=str(Path(__file__).parent / 'captures'))
     ap.add_argument('--status-scale', type=float, default=0.6,
                     help='font scale for the status line (try 2.0+ to read glasses-off)')
+    ap.add_argument('--black-bg', action='store_true',
+                    help='render overlays on a pure-black canvas instead of the webcam feed')
+    ap.add_argument('--fullscreen', action='store_true',
+                    help='show the display window in fullscreen mode (hides any '
+                         'white window chrome that reflects in glasses)')
     return ap.parse_args()
 
 
@@ -387,7 +392,11 @@ def main():
     q = QToggle()
 
     win = 'capture'
-    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    if args.fullscreen:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    else:
+        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
     try:
         while True:
@@ -413,7 +422,7 @@ def main():
             else:
                 face_lms = None
 
-            overlay = frame.copy()
+            overlay = np.zeros_like(frame) if args.black_bg else frame.copy()
             calib.draw(overlay)
             for side, (gt, _, pupil_px) in captures.items():
                 cv2.circle(overlay, (int(pupil_px[0]), int(pupil_px[1])),

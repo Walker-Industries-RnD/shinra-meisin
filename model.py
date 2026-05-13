@@ -12,6 +12,22 @@ def fuse(early, mid):
     mid = F.interpolate(mid, size=early.shape[-2:], mode='nearest')
     return torch.cat([early, mid], dim=1)
 
+class DepthwiseSepConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.dw = nn.Sequential( # depthwise convolution, just spatial mixing
+            nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=3, padding=1, padding_mode='zeros', groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(inplace=True)
+        )
+        self.pw = nn.Sequential( # pointwise convolutions, just channel mixing
+            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
 class RegressionHead(nn.Module): # standard regression, like for scalars and vectors
     def __init__(self, in_features, out_features, pool, log_var=True, dropout=0.3):
         super().__init__()
@@ -51,20 +67,19 @@ class HeatmapHead(nn.Module): # heatmaps for precise sub-pixel localization
 
         self.temp = temp
 
-        # initialize 1x1 conv gateways. 192 (128+64) channels is a lot
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=in_channels // 2, kernel_size=1, bias=False)
-        self.act = nn.SiLU()
-        self.conv2 = nn.Conv2d(in_channels=in_channels // 2, out_channels=out_channels, kernel_size=1, bias=False)
+        # initialize 3x3 depthwise separable convolutions (of MobileNet inspiration)
+        self.dsc1 = DepthwiseSepConv(in_channels=in_channels, out_channels=in_channels // 2)
+        self.dsc2 = DepthwiseSepConv(in_channels=in_channels // 2, out_channels=out_channels)
     def forward(self, x):
-        logits = self.conv2(self.act(self.conv1(x)))
+        logits = self.dsc2(self.dsc1(x))
 
         B, C, H, W = logits.shape
         soft_map = torch.softmax(logits.view(B, C, -1) / self.temp, dim=-1).view(B, C, H, W) # 2d softmax here - first explode logits to (B, C, 64*48), do softmax, then reshape to (B, C, H, W)
-        self.last_soft_map = soft_map  # (B, 17, H, W) — stashed for heatmap visualisation
+        self.last_soft_map = soft_map  # (B, 17, H, W) - stashed for heatmap visualisation
         pred_x = (soft_map * self.grid_x).sum(dim=[-2, -1])
         pred_y = (soft_map * self.grid_y).sum(dim=[-2, -1])
         pts = torch.stack([pred_x, pred_y], dim=-1)
-        return pts
+        return pts, logits
 
 class ShinraCNN(nn.Module):
     def __init__(self):
@@ -116,7 +131,7 @@ class ShinraCNN(nn.Module):
 
         fused_features = fuse(taps[0], taps[1])
 
-        landmark_pred = self.landmark_head(fused_features) # 64x48x192, fused from 64x48x64 (early) and 32x24x128 (mid) FPN style
+        landmark_pred, landmark_logits = self.landmark_head(fused_features) # 64x48x192, fused from 64x48x64 (early) and 32x24x128 (mid) FPN style
         gaze_pred, gaze_lvar = self.gaze_head(taps[2]) # 8x6x256. gaze is a global deal
         diam_pred, diam_lvar = self.diameter_head(taps[2]) # also 8x6x256, we have it pull from a pooled deep tap too because spanning the pupil with respect to the whole eye could use some global context
 
@@ -127,10 +142,10 @@ class ShinraCNN(nn.Module):
         else:
             clf_preds = []
 
-        return landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds
+        return (landmark_pred, landmark_logits), (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds
     def thaw(self):
-        head_lr_map = torch.linspace(5e-4, 1e-4, len(self.segments))
-        segment_lr_map = torch.linspace(2e-4, 2e-5, len(self.segments))
+        head_lr_map = torch.linspace(5e-4, 4e-4, len(self.segments))
+        segment_lr_map = torch.linspace(2e-4, 4e-5, len(self.segments))
 
         head_params = (list(self.landmark_head.parameters()) +
                        list(self.diameter_head.parameters()) +

@@ -14,6 +14,7 @@ import argparse
 import glob
 import os
 import sys
+import time
 
 import cv2
 import matplotlib.patches as mpatches
@@ -23,7 +24,7 @@ import torch
 import torchvision.transforms.v2.functional as TF
 
 from input import (
-    GIWDataset, SyntheticDataset, WebcamDataset,
+    RealDataset, SyntheticDataset, WebcamDataset,
     INPUT_H, INPUT_W, MAX_PUPIL_DIAMETER, RAW_INPUT_H, RAW_INPUT_W,
     cam_transforms, to_gray_tensor,
 )
@@ -79,7 +80,7 @@ def run_inference(model, img_tensor):
     heatmap: (H, W) float32 — max activation across all 17 softmax landmark maps.
     """
     with torch.no_grad():
-        lm_pred, (diam_pred, _), (gaze_pred, _), _ = model(
+        (lm_pred, _), (diam_pred, _), (gaze_pred, _), _ = model(
             img_tensor.unsqueeze(0).to(DEVICE)
         )
     lm_np    = lm_pred[0].cpu().numpy()              # (17, 2) in [0,1]
@@ -165,50 +166,52 @@ def dataset_mode(n_samples, ckpt_path):
 
     n_per  = max(n_samples // 3, 1)
     syn_ds = SyntheticDataset()
-    giw_ds = GIWDataset()
+    real_ds = RealDataset()
     cam_ds = WebcamDataset(transforms=cam_transforms)
 
     def sample(ds, k):
         return random.sample(range(len(ds)), min(k, len(ds)))
 
-    groups = [
-        ('Synthetic', sample(syn_ds, n_per), syn_ds, True),
-        ('GIW',       sample(giw_ds, n_per), giw_ds, True),
-        ('Webcam',    sample(cam_ds, n_per), cam_ds, False),
-    ]
+    def collect():
+        groups = [
+            ('Synthetic', sample(syn_ds, n_per), syn_ds, True),
+            ('Real',      sample(real_ds, n_per), real_ds, True),
+            ('Webcam',    sample(cam_ds, n_per), cam_ds, False),
+        ]
+        out = []
+        for domain, idxs, ds, has_gt in groups:
+            row_samples = []
+            for idx in idxs:
+                if has_gt:
+                    img_tensor, gt = ds[idx]
+                else:
+                    img_tensor = ds[idx]
+                    gt = None
+                lm_pred, diam_pred_px, gaze_pred, heatmap = run_inference(model, img_tensor)
+                s = {
+                    'img_display': denorm_image(img_tensor),
+                    'lm_pred_px':  scale_lm(lm_pred),
+                    'gaze_pred':   gaze_pred,
+                    'diam_pred_px': diam_pred_px,
+                    'heatmap':     heatmap,
+                    'domain':      domain,
+                    'has_gt':      has_gt,
+                }
+                if gt is not None:
+                    eye_state = int(gt['eye_state'].item())
+                    s.update({
+                        'lm_gt_px':   scale_lm(gt['landmarks'].numpy()),
+                        'diam_gt_px': gt['pupil_diameter'].item() * MAX_PUPIL_DIAMETER,
+                        'gaze_gt':    gt['gaze_vector'].numpy(),
+                        'state':  'Synthetic' if eye_state == 0 else EYE_STATES.get(eye_state, '?'),
+                        'pvalid': 'pup✓' if gt['pupil_valid'].item() else 'pup✗',
+                        'lvalid': 'lid✓' if gt['lid_valid'].item()   else 'lid✗',
+                    })
+                row_samples.append(s)
+            out.append((domain, row_samples))
+        return out
 
-    # Pre-collect inference results so toggling doesn't re-run the model.
-    collected = []
-    for domain, idxs, ds, has_gt in groups:
-        row_samples = []
-        for idx in idxs:
-            if has_gt:
-                img_tensor, gt = ds[idx]
-            else:
-                img_tensor = ds[idx]
-                gt = None
-            lm_pred, diam_pred_px, gaze_pred, heatmap = run_inference(model, img_tensor)
-            s = {
-                'img_display': denorm_image(img_tensor),
-                'lm_pred_px':  scale_lm(lm_pred),
-                'gaze_pred':   gaze_pred,
-                'diam_pred_px': diam_pred_px,
-                'heatmap':     heatmap,
-                'domain':      domain,
-                'has_gt':      has_gt,
-            }
-            if gt is not None:
-                eye_state = int(gt['eye_state'].item())
-                s.update({
-                    'lm_gt_px':   scale_lm(gt['landmarks'].numpy()),
-                    'diam_gt_px': gt['pupil_diameter'].item() * MAX_PUPIL_DIAMETER,
-                    'gaze_gt':    gt['gaze_vector'].numpy(),
-                    'state':  'Synthetic' if eye_state == 0 else EYE_STATES.get(eye_state, '?'),
-                    'pvalid': 'pup✓' if gt['pupil_valid'].item() else 'pup✗',
-                    'lvalid': 'lid✓' if gt['lid_valid'].item()   else 'lid✗',
-                })
-            row_samples.append(s)
-        collected.append((domain, row_samples))
+    collected = collect()
 
     ncols = n_per
     fig, axes = plt.subplots(3, ncols, figsize=(ncols * 5, 3 * 4.2), squeeze=False)
@@ -264,7 +267,7 @@ def dataset_mode(n_samples, ckpt_path):
 
         mode_label = 'Heatmap' if hm_mode else 'Normal'
         plt.suptitle(
-            f'Shinra-Meisin — multi-domain inference  [{mode_label} | ←/→ to toggle]',
+            f'Shinra-Meisin — multi-domain inference  [{mode_label} | ←/→ toggle | q resample]',
             fontsize=12,
         )
         fig.canvas.draw_idle()
@@ -273,11 +276,16 @@ def dataset_mode(n_samples, ckpt_path):
         if event.key in ('left', 'right'):
             show_hm[0] = not show_hm[0]
             draw(show_hm[0])
+        elif event.key == 'q':
+            collected[:] = collect()
+            draw(show_hm[0])
 
     # Remove matplotlib's default arrow-key navigation bindings so our handler
-    # receives them instead of the toolbar consuming them first.
+    # receives them instead of the toolbar consuming them first. Same for 'q',
+    # which by default closes the figure.
     plt.rcParams['keymap.back']    = [k for k in plt.rcParams['keymap.back']    if k != 'left']
     plt.rcParams['keymap.forward'] = [k for k in plt.rcParams['keymap.forward'] if k != 'right']
+    plt.rcParams['keymap.quit']    = [k for k in plt.rcParams['keymap.quit']    if k != 'q']
 
     fig.canvas.mpl_connect('key_press_event', on_key)
     draw(False)
@@ -302,6 +310,10 @@ def webcam_mode(cam_index, ckpt_path):
     show_heatmap = False
     print("Webcam live — ←/→ to toggle heatmap, hold '1' to capture, 'q' to quit.")
 
+    WIN_NAME = 'Shinra-Meisin'
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -309,7 +321,13 @@ def webcam_mode(cam_index, ckpt_path):
             break
 
         img_tensor, crop = preprocess_frame(frame)
+        if DEVICE.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         lm_pred, diam_px, gaze_xyz, heatmap = run_inference(model, img_tensor)
+        if DEVICE.type == 'cuda':
+            torch.cuda.synchronize()
+        infer_ms = (time.perf_counter() - t0) * 1000.0
 
         display = frame.copy()
 
@@ -331,9 +349,22 @@ def webcam_mode(cam_index, ckpt_path):
         cv_draw_landmarks(display, lm_px, CV_PRED)
         cv_draw_gaze(display, gaze_xyz, lm_px[16], CV_GAZE)
 
+        # Diameter as horizontal segment centered on the pupil prediction.
+        # diam_px lives in 640×480 raw-input space, matching the display crop.
+        px, py = float(lm_px[16][0]), float(lm_px[16][1])
+        x1, x2 = int(round(px - diam_px / 2)), int(round(px + diam_px / 2))
+        cv2.line(display, (x1, int(round(py))), (x2, int(round(py))),
+                 CV_PRED, 2, cv2.LINE_AA)
+
         cv2.putText(display, f'diam={diam_px:.1f}px',
                     (_CROP_X + 8, _CROP_Y + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, CV_PRED, 1, cv2.LINE_AA)
+
+        infer_text = f'{infer_ms:.1f} ms'
+        (tw, th), _ = cv2.getTextSize(infer_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.putText(display, infer_text,
+                    (display.shape[1] - tw - 10, th + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
 
         # waitKeyEx returns full extended keycodes for special keys (arrows etc.)
         key  = cv2.waitKeyEx(1)
@@ -350,7 +381,7 @@ def webcam_mode(cam_index, ckpt_path):
             cv2.putText(display, 'REC', (_CROP_X + 8, _CROP_Y + 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 220), 2, cv2.LINE_AA)
 
-        cv2.imshow('Shinra-Meisin', display)
+        cv2.imshow(WIN_NAME, display)
         if key8 == ord('q'):
             break
 

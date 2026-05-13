@@ -1,10 +1,11 @@
-from input import SharedDataset, WebcamDataset, giw_transforms, cam_transforms, GIWDataset, session_split, SyntheticDataset
+from input import SharedDataset, WebcamDataset, real_transforms, cam_transforms, RealDataset, session_split, SyntheticDataset
 from model import ShinraCNN
 from torch.utils.data import DataLoader, random_split
 import torch.nn.functional as F
 import torch
 import time, os, math
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from early_stopping import EarlyStopping
 from numpy import mean
 
@@ -14,7 +15,9 @@ def _infinite_loader(loader):
         yield from loader
 
 BATCH_SIZE = 64
-NUM_EPOCHS = 10 # per phase
+HEATMAP_SIGMA = 2.5
+HEATMAP_LAMBDA = 0.25
+NUM_EPOCHS = 20 # per phase
 PATIENCE = 5 # for early stopping, this is how many epochs of no val loss improvement to end phase
 
 loss_weights = {
@@ -27,6 +30,25 @@ loss_weights = {
     'clf_cam': 1
     # 'state': 1,
 }
+
+def make_gaussian_heatmaps(coords, H, W, sigma=HEATMAP_SIGMA):
+    """coords: (B, K, 2) normalized [0,1] (x, y) → (B, K, H, W) Gaussian targets"""
+    cx = coords[..., 0] * W  # (B, K)
+    cy = coords[..., 1] * H
+    ys = torch.arange(H, device=coords.device, dtype=coords.dtype)
+    xs = torch.arange(W, device=coords.device, dtype=coords.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # (H, W)
+    dx = grid_x[None, None] - cx[..., None, None]  # (B, K, H, W)
+    dy = grid_y[None, None] - cy[..., None, None]
+    return torch.exp(-(dx ** 2 + dy ** 2) / (2 * sigma ** 2))
+
+def focal_loss(logits, targets, gamma=2):
+    p = torch.sigmoid(logits)
+    log_p   = F.logsigmoid(logits)
+    log_1mp = F.logsigmoid(-logits)
+    pos = -(1 - p).pow(gamma) * log_p   * targets
+    neg = -p.pow(gamma)       * log_1mp * (1 - targets)
+    return (pos + neg).mean()
 
 def heteroscedastic_loss(pred, truth, log_var, weight=None):
     precision = torch.exp(-log_var)
@@ -74,18 +96,18 @@ else:
     resume_epoch = 0
 
 
-real_ds  = GIWDataset(transforms=giw_transforms)
-synth_ds = SyntheticDataset(transforms=giw_transforms)
+real_ds  = RealDataset(transforms=real_transforms)
+synth_ds = SyntheticDataset(transforms=real_transforms)
 cam_ds = WebcamDataset(transforms=cam_transforms)
-giw_train, giw_val = session_split(real_ds)
+real_train, real_val = session_split(real_ds)
 
 #train_len = int(len(synth_ds) * .7)
 #synth_train, synth_val = random_split(synth_ds, [train_len, len(synth_ds) - train_len])
 
-train_ds = SharedDataset(giw_subset=giw_train, synthetic=synth_ds, phase=start_phase, epoch_size=len(synth_ds))
+train_ds = SharedDataset(real_subset=real_train, synthetic=synth_ds, phase=start_phase, epoch_size=len(synth_ds), hard_weight=1.6)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, shuffle=False)
-val_loader   = DataLoader(giw_val,  batch_size=BATCH_SIZE, num_workers=2, pin_memory=True, shuffle=False)
+val_loader   = DataLoader(real_val, batch_size=BATCH_SIZE, num_workers=2, pin_memory=True, shuffle=False)
 
 cam_loader   = DataLoader(cam_ds,   batch_size=BATCH_SIZE, num_workers=2, pin_memory=True, shuffle=True, drop_last=True)
 cam_cycle = _infinite_loader(cam_loader)
@@ -103,7 +125,7 @@ def process_batch(phase, model, optim, imgs, lbls, epoch_losses=None, eval=False
     before = time.monotonic_ns()
     
     cam_arg = cam_imgs.to(device) if (phase > 1 and cam_imgs is not None) else None
-    landmark_pred, (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds = model(train_imgs.to(device), cam_imgs=cam_arg)
+    (landmark_pred, landmark_logits), (diam_pred, diam_lvar), (gaze_pred, gaze_lvar), clf_preds = model(train_imgs.to(device), cam_imgs=cam_arg)
 
     pred_time = time.monotonic_ns() - before
 
@@ -113,7 +135,11 @@ def process_batch(phase, model, optim, imgs, lbls, epoch_losses=None, eval=False
 
     diameter_loss, diam_sq_err, diam_mean_lvar = heteroscedastic_loss(diam_pred, diam_gt, diam_lvar)
     gaze_loss, gaze_sq_err, gaze_mean_lvar = heteroscedastic_loss(gaze_pred, gaze_gt, gaze_lvar)
-    landmark_loss = F.smooth_l1_loss(landmark_pred, landmark_gt, beta=0.025)
+    _, _, H, W = landmark_logits.shape
+    gauss_gt = make_gaussian_heatmaps(landmark_gt, H, W)
+    gauss_loss = focal_loss(landmark_logits, gauss_gt)
+    coord_loss = F.smooth_l1_loss(landmark_pred, landmark_gt, beta=0.025)
+    landmark_loss = HEATMAP_LAMBDA * gauss_loss + (1 - HEATMAP_LAMBDA) * coord_loss
 
     total_loss = (loss_weights['diameter_se'] * diameter_loss) + (loss_weights['gaze_se'] * gaze_loss) + (loss_weights['landmarks'] * landmark_loss)
 
@@ -152,9 +178,10 @@ for idx, groups in shinra.thaw():
     os.makedirs(phase_dir, exist_ok=True)
     
     optim = Adam(params=groups, lr=1e-4)
+    scheduler = CosineAnnealingLR(optim, T_max=20, eta_min=1e-6,)
 
     stopper.reset()
-    dann_active = idx > 1
+    dann_active = False#idx > 1
     for epoch in range(resume_epoch, start_epoch + NUM_EPOCHS):
         epoch_losses = {head: [] for head in loss_weights.keys()}
         pred_time = []
@@ -208,6 +235,7 @@ for idx, groups in shinra.thaw():
             'epoch': epoch
         }, os.path.join(phase_dir, f'shinra_checkpoint_{epoch}.pth'))
 
+        scheduler.step()
         stopper.feed(mean(val_losses))
         if stopper.stop:
             print(f'Early stopping at epoch {epoch} (phase {idx})')
