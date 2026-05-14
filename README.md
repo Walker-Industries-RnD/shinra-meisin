@@ -22,7 +22,7 @@ The Shinra-Meisin connects to other programs through OSC and/or [Eclipse](https:
 
 | <img src="docs/0.-assets/walkerdev.png" width="220" /> | <img src="docs/0.-assets/kennaness.png" width="220" /> | <img src="docs/0.-assets/john.png" width="220" /> |
 |---|---|---|
-| **Project Lead - WalkerDev**<br>“Loving coding is the same as hating yourself”<br>[Discord](https://discord.gg/H8h8scsxtH) | **Art - Kennaness**<br>“When will I get my isekai?”<br>[Bluesky](https://bsky.app/profile/kennaness.bsky.social) • [ArtStation](https://www.artstation.com/kennaness) | **Eye Tracking System Lead - John**<br>“I cant think of a quote you can leave it alone for now” |
+| **Project Lead - WalkerDev**<br>“Loving coding is the same as hating yourself”<br>[Discord](https://discord.gg/H8h8scsxtH) | **Art - Kennaness**<br>“When will I get my isekai?”<br>[Bluesky](https://bsky.app/profile/kennaness.bsky.social) • [ArtStation](https://www.artstation.com/kennaness) | **Eye Tracking System Lead - John**<br>“Is this what they call larping?” |
 
 <br>
 
