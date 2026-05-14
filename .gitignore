@@ -228,8 +228,6 @@ phase_2/
 phase_3/
 phase_4/
 *.docx
-./*.pth
 ./*.txt
-*.pth
 *.parquet
 __pycache__/
