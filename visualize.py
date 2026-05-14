@@ -45,6 +45,9 @@ COLOR_PRED = '#ff5252'
 CV_PRED  = (82, 82, 255)   # #ff5252
 CV_GAZE  = (255, 200, 0)   # cyan-ish
 
+# Overlay cycle (K key): all overlays → gaze only → landmarks only → diameter only
+OVERLAY_MODES = ('all', 'gaze', 'landmarks', 'diameter')
+
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
 
@@ -120,6 +123,12 @@ def mpl_draw_gaze(ax, gaze_xyz, origin_px, color, scale=90):
     dx, dy = float(gaze_xyz[0]) * scale, float(gaze_xyz[1]) * scale
     ax.annotate('', xy=(ox + dx, oy + dy), xytext=(ox, oy),
                 arrowprops=dict(arrowstyle='->', color=color, lw=2.0))
+
+
+def mpl_draw_diameter(ax, lm_px, diam_px, color):
+    px, py = float(lm_px[16, 0]), float(lm_px[16, 1])
+    ax.plot([px - diam_px / 2, px + diam_px / 2], [py, py], '-', color=color, lw=2, alpha=0.9)
+    ax.plot(px, py, '*', color=color, ms=9, alpha=0.9)
 
 
 # ── OpenCV drawing (webcam mode) ──────────────────────────────────────────────
@@ -215,9 +224,15 @@ def dataset_mode(n_samples, ckpt_path):
 
     ncols = n_per
     fig, axes = plt.subplots(3, ncols, figsize=(ncols * 5, 3 * 4.2), squeeze=False)
-    show_hm = [False]
+    show_hm      = [False]
+    overlay_mode = [0]   # index into OVERLAY_MODES
 
     def draw(hm_mode):
+        mode = OVERLAY_MODES[overlay_mode[0]]
+        show_lm   = mode in ('all', 'landmarks')
+        show_gaze = mode in ('all', 'gaze')
+        show_diam = mode in ('all', 'diameter')
+
         for row_idx, (domain, samples) in enumerate(collected):
             for col, s in enumerate(samples):
                 ax = axes[row_idx][col]
@@ -239,12 +254,21 @@ def dataset_mode(n_samples, ckpt_path):
                 ax.set_ylim(DISPLAY_H, 0)
                 ax.axis('off')
 
-                if s['has_gt'] and not hm_mode:
-                    mpl_draw_landmarks(ax, s['lm_gt_px'],  COLOR_GT,   label='GT')
-                    mpl_draw_gaze(ax, s['gaze_gt'], s['lm_gt_px'][16], COLOR_GT)
+                if not hm_mode:
+                    if s['has_gt']:
+                        if show_lm:
+                            mpl_draw_landmarks(ax, s['lm_gt_px'], COLOR_GT, label='GT')
+                        if show_gaze:
+                            mpl_draw_gaze(ax, s['gaze_gt'], s['lm_gt_px'][16], COLOR_GT)
+                        if show_diam:
+                            mpl_draw_diameter(ax, s['lm_gt_px'], s['diam_gt_px'], COLOR_GT)
 
-                mpl_draw_landmarks(ax, s['lm_pred_px'], COLOR_PRED, label='Pred')
-                mpl_draw_gaze(ax, s['gaze_pred'], s['lm_pred_px'][16], COLOR_PRED)
+                    if show_lm:
+                        mpl_draw_landmarks(ax, s['lm_pred_px'], COLOR_PRED, label='Pred')
+                    if show_gaze:
+                        mpl_draw_gaze(ax, s['gaze_pred'], s['lm_pred_px'][16], COLOR_PRED)
+                    if show_diam:
+                        mpl_draw_diameter(ax, s['lm_pred_px'], s['diam_pred_px'], COLOR_PRED)
 
                 if s['has_gt']:
                     ax.set_title(
@@ -265,9 +289,11 @@ def dataset_mode(n_samples, ckpt_path):
             handles.insert(0, mpatches.Patch(color=COLOR_GT, label='GT'))
         axes[0][0].legend(handles=handles, loc='lower right', fontsize=8)
 
-        mode_label = 'Heatmap' if hm_mode else 'Normal'
+        hm_label      = 'Heatmap' if hm_mode else 'Normal'
+        overlay_label = mode if mode != 'all' else 'all overlays'
         plt.suptitle(
-            f'Shinra-Meisin — multi-domain inference  [{mode_label} | ←/→ toggle | q resample]',
+            f'Shinra-Meisin — multi-domain inference  '
+            f'[{hm_label} | ←/→ heatmap | k overlay: {overlay_label} | q resample]',
             fontsize=12,
         )
         fig.canvas.draw_idle()
@@ -275,6 +301,9 @@ def dataset_mode(n_samples, ckpt_path):
     def on_key(event):
         if event.key in ('left', 'right'):
             show_hm[0] = not show_hm[0]
+            draw(show_hm[0])
+        elif event.key == 'k':
+            overlay_mode[0] = (overlay_mode[0] + 1) % len(OVERLAY_MODES)
             draw(show_hm[0])
         elif event.key == 'q':
             collected[:] = collect()
@@ -307,8 +336,9 @@ def webcam_mode(cam_index, ckpt_path):
     ]
     capture_idx = max(existing) + 1 if existing else 0
 
-    show_heatmap = False
-    print("Webcam live — ←/→ to toggle heatmap, hold '1' to capture, 'q' to quit.")
+    show_heatmap    = False
+    overlay_mode_idx = 0
+    print("Webcam live — ←/→ to toggle heatmap, k to cycle overlays, hold '1' to capture, 'q' to quit.")
 
     WIN_NAME = 'Shinra-Meisin'
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
@@ -346,17 +376,26 @@ def webcam_mode(cam_index, ckpt_path):
         # Shift landmarks from crop-space into full-frame-space before drawing.
         lm_px = scale_lm(lm_pred) + np.array([_CROP_X, _CROP_Y], dtype=np.float32)
 
-        cv_draw_landmarks(display, lm_px, CV_PRED)
-        cv_draw_gaze(display, gaze_xyz, lm_px[16], CV_GAZE)
+        mode     = OVERLAY_MODES[overlay_mode_idx]
+        show_lm   = mode in ('all', 'landmarks')
+        show_gaze = mode in ('all', 'gaze')
+        show_diam = mode in ('all', 'diameter')
+
+        if show_lm:
+            cv_draw_landmarks(display, lm_px, CV_PRED)
+        if show_gaze:
+            cv_draw_gaze(display, gaze_xyz, lm_px[16], CV_GAZE)
 
         # Diameter as horizontal segment centered on the pupil prediction.
         # diam_px lives in 640×480 raw-input space, matching the display crop.
         px, py = float(lm_px[16][0]), float(lm_px[16][1])
-        x1, x2 = int(round(px - diam_px / 2)), int(round(px + diam_px / 2))
-        cv2.line(display, (x1, int(round(py))), (x2, int(round(py))),
-                 CV_PRED, 2, cv2.LINE_AA)
+        if show_diam:
+            x1, x2 = int(round(px - diam_px / 2)), int(round(px + diam_px / 2))
+            cv2.line(display, (x1, int(round(py))), (x2, int(round(py))),
+                     CV_PRED, 2, cv2.LINE_AA)
+            cv2.circle(display, (int(round(px)), int(round(py))), 3, CV_PRED, -1, cv2.LINE_AA)
 
-        cv2.putText(display, f'diam={diam_px:.1f}px',
+        cv2.putText(display, f'diam={diam_px:.1f}px  [{mode}]',
                     (_CROP_X + 8, _CROP_Y + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, CV_PRED, 1, cv2.LINE_AA)
 
@@ -372,6 +411,8 @@ def webcam_mode(cam_index, ckpt_path):
 
         if key in (65361, 65363):  # left / right arrow (Linux X11 / GTK)
             show_heatmap = not show_heatmap
+        if key8 in (ord('k'), ord('K')):
+            overlay_mode_idx = (overlay_mode_idx + 1) % len(OVERLAY_MODES)
 
         if key8 == ord('1'):
             gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)

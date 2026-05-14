@@ -10,6 +10,11 @@ Per frame, overlays:
 Loads a single capture run (the directory containing eye0/ and eye1/) and
 walks both eyes in sync.
 
+By default the viewer normalizes randomly-cropped frames so the pupil sits at
+a consistent position: it finds the maximally-open frame for each eye (largest
+vertical gap between upper and lower lid landmarks) and translates every other
+frame to match that pupil position.  Pass --no-normalize to disable.
+
 Controls: SPACE pause/resume, ← / → step, , / . step (no arrow keys),
           + / - speed, q or ESC quit.
 """
@@ -71,12 +76,70 @@ def load_gt(png_path):
         return json.load(f)
 
 
-def render_panel(png_path, label):
+def find_reference_pupil(png_paths):
+    """Return (px, py) in pixels from the frame whose eye is most open.
+
+    Eye openness is the mean vertical gap between the upper (lm[0:8]) and
+    lower (lm[8:16]) lid rows.  Only JSONs are read after the first image
+    is decoded to learn the frame dimensions.
+    """
+    h = w = None
+    for p in png_paths:
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            h, w = img.shape[:2]
+            break
+    if h is None:
+        return None
+
+    best_open = -1.0
+    best_pupil = None
+    for png_path in png_paths:
+        json_path = Path(png_path).with_suffix('.json')
+        if not json_path.exists():
+            continue
+        try:
+            with open(json_path) as f:
+                gt = json.load(f)
+        except Exception:
+            continue
+        lm = np.array(gt['landmarks'], dtype=np.float32)
+        openness = float(lm[8:16, 1].mean() - lm[:8, 1].mean()) * h
+        if openness > best_open:
+            best_open = openness
+            best_pupil = (float(lm[16, 0] * w), float(lm[16, 1] * h))
+    return best_pupil
+
+
+def render_panel(png_path, label, target_pupil=None):
     gray = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
         return None
-    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     gt = load_gt(png_path)
+    h, w = gray.shape[:2]
+
+    if target_pupil is not None:
+        lm = np.array(gt['landmarks'], dtype=np.float32)
+        dx = int(round(target_pupil[0] - lm[16, 0] * w))
+        dy = int(round(target_pupil[1] - lm[16, 1] * h))
+        if dx != 0 or dy != 0:
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+            margin = 12
+            skin_val = int(np.median([
+                gray[:margin, :margin],
+                gray[:margin, -margin:],
+                gray[-margin:, :margin],
+                gray[-margin:, -margin:],
+            ]))
+            gray = cv2.warpAffine(gray, M, (w, h),
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=skin_val)
+            lm[:, 0] = (lm[:, 0] * w + dx) / w
+            lm[:, 1] = (lm[:, 1] * h + dy) / h
+            gt = dict(gt)
+            gt['landmarks'] = lm.tolist()
+
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     overlay(img, gt)
     es = {3: 'fixation', 4: 'saccade', 5: 'pursuit'}.get(int(gt['eye_state']), '?')
     g = gt['gaze_vector']
@@ -92,9 +155,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('run_dir',
                     help='captures/{run_ts} directory with eye0/ and eye1/')
-    ap.add_argument('--fps',   type=float, default=4.0)
-    ap.add_argument('--scale', type=float, default=1.5)
-    ap.add_argument('--start', type=int,   default=0)
+    ap.add_argument('--fps',          type=float, default=4.0)
+    ap.add_argument('--scale',        type=float, default=1.5)
+    ap.add_argument('--start',        type=int,   default=0)
+    ap.add_argument('--no-normalize', action='store_true',
+                    help='disable pupil-position normalization')
     args = ap.parse_args()
 
     run = Path(args.run_dir).expanduser()
@@ -106,6 +171,13 @@ def main():
     if n == 0:
         raise SystemExit(f'no PNGs found under {run}')
 
+    ref_pupils = {}
+    if not args.no_normalize:
+        print('Scanning for max-openness reference frames...', end=' ', flush=True)
+        for s in sides:
+            ref_pupils[s] = find_reference_pupil(listings[s])
+        print('done')
+
     i = max(0, min(args.start, n - 1))
     paused = False
     fps = args.fps
@@ -114,13 +186,16 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     while True:
-        panels = [render_panel(listings[s][i], s) for s in sides]
+        panels = [render_panel(listings[s][i], s, ref_pupils.get(s))
+                  for s in sides]
         combo = np.concatenate(panels, axis=1)
         if args.scale != 1.0:
             combo = cv2.resize(combo, None, fx=args.scale, fy=args.scale,
                                interpolation=cv2.INTER_LINEAR)
+        norm_tag = '' if args.no_normalize else '  [normalized]'
         footer = (f'{i + 1}/{n}   '
-                  f'{"PAUSED" if paused else f"{fps:.1f} fps"}   '
+                  f'{"PAUSED" if paused else f"{fps:.1f} fps"}'
+                  f'{norm_tag}   '
                   f'[SPACE pause] [, .  step] [+ -  speed] [q quit]')
         cv2.putText(combo, footer, (10, combo.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1, cv2.LINE_AA)
